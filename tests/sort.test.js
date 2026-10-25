@@ -117,6 +117,13 @@ describe('buildSortOrder', () => {
     assert.equal(order[1].cluster, 'Other');
   });
 
+  it('uses a selected Other / Uncategorised subject as the final fallback group', () => {
+    const videos = [video({ id: 'u' }), video({ id: 'n' }), video({ id: 'k' })];
+    const clusters = { clusters: [{ name: 'News', videoIds: ['n'] }, { name: 'Physics', videoIds: ['k'] }] };
+    const result = buildSortOrder(videos, clusters, [], ['News', 'Physics', 'Other / Uncategorised'], { inProgress: 'sort' });
+    assert.deepEqual(result.map(v => [v.id, v.cluster]), [['n', 'News'], ['k', 'Physics'], ['u', 'Other / Uncategorised']]);
+  });
+
   it('appends model-invented categories after the taxonomy', () => {
     const videos = [video({ id: 'n1' }), video({ id: 'm1' })];
     const withNew = { clusters: [{ name: 'Knitting', videoIds: ['n1'] }, { name: 'Music', videoIds: ['m1'] }] };
@@ -239,7 +246,7 @@ describe('normalizeSortOptions', () => {
 
   it('keeps whitelisted values and replaces unknown ones with the default', () => {
     const s = normalizeSortOptions({ withinGroup: 'title', inProgress: 'bogus', groupOrder: 'alpha', extra: 1 });
-    assert.deepEqual(s, { withinGroup: 'title', inProgress: 'top', groupOrder: 'alpha' });
+    assert.deepEqual(s, { withinGroup: 'title', secondaryWithinGroup: 'playlist', inProgress: 'top', groupOrder: 'alpha' });
   });
 
   it('maps the retired inProgress "ignore" onto "within" rather than the default', () => {
@@ -276,6 +283,12 @@ describe('buildSortOrder options: withinGroup', () => {
     assert.deepEqual(ids({ withinGroup: 'duration-desc' }), ['b', 'a', 'c']);
   });
 
+  it('strict duration ordering does not promote partially watched videos', () => {
+    const started = [video({ id: 'short-started', duration: 30, percentWatched: 50 }), video({ id: 'long', duration: 900, percentWatched: 0 })];
+    const result = buildSortOrder(started, { clusters: [{ name: 'Music', videoIds: ['short-started', 'long'] }] }, [], ['Music'], { withinGroup: 'duration-asc', inProgress: 'sort' });
+    assert.deepEqual(result.map(v => v.id), ['short-started', 'long']);
+  });
+
   it('playlist keeps arrival order, including across interleaved groups', () => {
     assert.deepEqual(ids({ withinGroup: 'playlist' }), ['a', 'b', 'c']);
     const mixed = [1, 2, 3, 4, 5, 6, 7].map(n => video({ id: String(n), duration: 1000 - n * 100 }));
@@ -289,6 +302,32 @@ describe('buildSortOrder options: withinGroup', () => {
 
   it('title sorts case-insensitively', () => {
     assert.deepEqual(ids({ withinGroup: 'title' }), ['b', 'a', 'c']);
+  });
+
+  it('applies secondary duration/title rules and original position as a stable final tie-breaker', () => {
+    const list = [
+      { id: 'a', title: 'Beta', duration: 10 },
+      { id: 'b', title: 'Alpha', duration: 10 },
+      { id: 'c', title: 'Alpha', duration: 5 },
+    ];
+    const grouped = { clusters: [{ name: 'Music', videoIds: ['a', 'b', 'c'] }] };
+    const ids = opts => buildSortOrder(list, grouped, [], ['Music'], { inProgress: 'sort', ...opts }).map(v => v.id);
+    assert.deepEqual(ids({ withinGroup: 'duration-asc', secondaryWithinGroup: 'title' }), ['c', 'b', 'a']);
+    assert.deepEqual(ids({ withinGroup: 'title', secondaryWithinGroup: 'duration-desc' }), ['b', 'c', 'a']);
+    assert.deepEqual(ids({ withinGroup: 'title', secondaryWithinGroup: 'playlist' }), ['b', 'c', 'a']);
+  });
+
+  it('allows a subject-specific primary and secondary sort to override shared defaults', () => {
+    const videos = [
+      { id: 'm-short', duration: 10, title: 'Zulu' }, { id: 'm-long', duration: 90, title: 'Alpha' },
+      { id: 'p-short', duration: 20, title: 'Zulu' }, { id: 'p-long', duration: 80, title: 'Alpha' },
+    ];
+    const clusters = { clusters: [{ name: 'Music', videoIds: ['m-short', 'm-long'] }, { name: 'Physics', videoIds: ['p-short', 'p-long'] }] };
+    const order = buildSortOrder(videos, clusters, [], ['Music', 'Physics'], {
+      withinGroup: 'duration-asc', inProgress: 'sort',
+      subjectSorts: { Physics: { withinGroup: 'duration-desc' }, Music: { withinGroup: 'title', secondaryWithinGroup: 'duration-desc' } },
+    });
+    assert.deepEqual(order.map(v => v.id), ['m-long', 'm-short', 'p-long', 'p-short']);
   });
 
   it('never changes the in-progress group, which always sorts by time left', () => {
@@ -446,6 +485,12 @@ describe('buildSimpleSortOrder', () => {
       video({ id: 'b1', channel: 'beta', title: 'One' }),
     ];
     assert.deepEqual(ids(buildSimpleSortOrder(videos, 'channel')), ['a1', 'b1', 'b2']);
+  });
+
+  it('supports descending title and leaves unavailable duration values last', () => {
+    const videos = [video({ id: 'unknown', duration: undefined, title: 'A' }), video({ id: 'known', duration: 20, title: 'B' })];
+    assert.deepEqual(ids(buildSortOrder(videos, { clusters: [{ name: 'Music', videoIds: ['unknown', 'known'] }] }, [], ['Music'], { withinGroup: 'title-desc', inProgress: 'sort' })), ['known', 'unknown']);
+    assert.deepEqual(ids(buildSimpleSortOrder(videos, 'duration')), ['known', 'unknown']);
   });
 
   it('is stable: equal keys keep playlist order', () => {

@@ -274,6 +274,20 @@ body {
 .wl-row:focus-within { outline: 2px solid var(--wl-accent); outline-offset: -2px; }
 .wl-row :focus-visible { outline: none; }
 
+.wl-subject-list { max-height: 180px; overflow: auto; border: 1px solid var(--wl-outline); border-radius: 8px; padding: 4px; }
+.wl-subject-list .wl-row { min-height: 34px; padding: 4px 8px; }
+.wl-selected-subject { display: grid; grid-template-columns: minmax(55px, 1fr) minmax(75px, 1.4fr) minmax(75px, 1.4fr) auto auto auto; gap: 5px; margin: 5px 0; }
+.wl-selected-subject input { min-width: 0; width: 100%; }
+.wl-selected-subject select { min-width: 0; width: 100%; grid-column: span 3; }
+.wl-selected-subject button { padding: 4px 6px; }
+.wl-inline { flex-wrap: wrap; }
+
 @media (prefers-reduced-motion: reduce) {
   .wl-switch, .wl-switch::before { transition: none; }
 }
+.wl-learning-item { border: 1px solid var(--border, #8885); border-radius: 6px; padding: 8px; margin: 6px 0; }
+.wl-learning-item p { margin: 0 0 6px; font-size: 12px; line-height: 1.4; }
+.wl-learning-item .wl-btn { margin: 2px 4px 2px 0; }
+.wl-section h3 { font-size: 13px; margin: 0 0 8px; }
+#automation-status { white-space: pre-wrap; line-height: 1.5; }
+#automation-history { max-height: 180px; overflow-y: auto; }

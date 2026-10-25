@@ -5,7 +5,7 @@
   "version": "0.7.2",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "build": "./build.sh"
+    "build": "node build.mjs"
   },
   "devDependencies": {
     "canvas": "^3.2.1"

@@ -66,7 +66,7 @@ function loadPanel(sandbox = {}) {
       stop() {},
       clear() {},
     },
-    chrome: { runtime: { sendMessage: async () => ({ success: true, sortOrder: [] }) } },
+    chrome: { runtime: { sendMessage: async () => ({ success: true, sortOrder: [] }), onMessage: { addListener() {} } } },
     ...sandbox,
   });
 }
@@ -86,12 +86,13 @@ function loadPanel(sandbox = {}) {
  * `mode` seeds currentMode (default 'ai', the only mode whose session accepts
  * toggleUnwatched()/changeSortOptions()); runSort() overwrites it.
  */
-function loadPanelWithStubs({ sendMessage, enrich, videos, applyOrder, toggleOverride, reload, runTimers, sortOrder, playlistId, setGroupMap, setSortOptions, sortOptions, ensureManual, getUndo, setUndo, mode = 'ai' }) {
-  const modalCalls = { showBusy: [], showPreview: [], showPreviewOptions: [], showError: [], setStatus: [], headingsToggle: [] };
+function loadPanelWithStubs({ sendMessage, enrich, videos, readSnapshot, applyOrder, toggleOverride, reload, runTimers, sortOrder, playlistId, setGroupMap, setSortOptions, sortOptions, ensureManual, getUndo, setUndo, mode = 'ai', location, document }) {
+  const modalCalls = { showBusy: [], showPreview: [], showPreviewOptions: [], showPreviewMeta: [], showError: [], setStatus: [], headingsToggle: [] };
+  const runtimeMessages = { listener: null };
   const sandbox = {
-    chrome: { runtime: { sendMessage } },
+    chrome: { runtime: { sendMessage, onMessage: { addListener(listener) { runtimeMessages.listener = listener; } } } },
     WLViewSort: { ensureManual: ensureManual || (async () => 'manual'), current: () => 'Manual' },
-    WLPlaylist: { read: async () => videos, applyOrder },
+    WLPlaylist: { read: async () => videos, readSnapshot: readSnapshot || (async () => ({ videos: videos || [], complete: true })), applyOrder },
     WLEnrich: { enrich },
     WLStorage: {
       toggleOverride,
@@ -116,7 +117,7 @@ function loadPanelWithStubs({ sendMessage, enrich, videos, applyOrder, toggleOve
       close() {},
       open() {},
       showBusy(text) { modalCalls.showBusy.push(text); },
-      showPreview(order, options) { modalCalls.showPreview.push(order); modalCalls.showPreviewOptions.push(options); },
+      showPreview(order, options, subjects, meta) { modalCalls.showPreview.push(order); modalCalls.showPreviewOptions.push(options); modalCalls.showPreviewMeta.push(meta); },
       showError(msg) { modalCalls.showError.push(msg); },
       setStatus(text) { modalCalls.setStatus.push(text); },
     },
@@ -124,6 +125,8 @@ function loadPanelWithStubs({ sendMessage, enrich, videos, applyOrder, toggleOve
   if (reload) {
     sandbox.location = { ...locationStub, reload };
   }
+  if (location) sandbox.location = location;
+  if (document) sandbox.document = document;
   if (runTimers) {
     sandbox.setTimeout = (fn) => { fn(); return 0; };
   }
@@ -131,8 +134,9 @@ function loadPanelWithStubs({ sendMessage, enrich, videos, applyOrder, toggleOve
   if (sortOrder) WLPanel.currentSortOrder = sortOrder;
   if (playlistId) WLPanel.currentPlaylistId = playlistId;
   if (sortOptions) WLPanel.currentSortOptions = sortOptions;
+  if (sortOrder) WLPanel.currentCanApply = true;
   WLPanel.currentMode = mode;
-  return { WLPanel, modalCalls, WLModal: sandbox.WLModal };
+  return { WLPanel, modalCalls, WLModal: sandbox.WLModal, runtimeMessages };
 }
 
 describe('runSort mode selection', () => {
@@ -205,6 +209,74 @@ describe('runSort mode selection', () => {
     assert.equal(sent[0].type, 'ANALYZE');
     assert.ok(sent[0].playlistId, 'ANALYZE must carry the playlistId');
     assert.equal(WLPanel.currentMode, 'ai');
+  });
+});
+
+describe('background unattended content handler', () => {
+  function accountDocument() {
+    return { ...documentStub, querySelector: () => ({ getAttribute: () => '/@example' }) };
+  }
+  function invoke(listener, message) {
+    return new Promise(resolve => {
+      const keepAlive = listener(message, {}, resolve);
+      assert.equal(keepAlive, true, 'asynchronous automation handler keeps the response channel open');
+    });
+  }
+
+  it('classifies available entries but refuses a write when completeness is unverified', async () => {
+    const videos = [{ id: 'a', setVideoId: 'A', title: 'A', unavailable: false }];
+    let writes = 0;
+    const loc = { href: 'https://www.youtube.com/playlist?list=WL#wl-organizer-automation', pathname: '/not-playlist', search: '?list=WL', hash: '#wl-organizer-automation' };
+    const { runtimeMessages } = loadPanelWithStubs({
+      sendMessage: async message => message.type === 'ANALYZE' ? { success: true, sortOrder: videos, classifiedCount: 1 } : { success: true },
+      enrich: async () => {}, videos, location: loc, document: accountDocument(),
+      readSnapshot: async () => ({ videos, complete: false, reason: 'header count mismatched', diagnostics: { pageCount: 1 } }),
+      applyOrder: async () => { writes++; return { applied: true, moveCount: 1 }; },
+    });
+    loc.pathname = '/playlist';
+    const result = await invoke(runtimeMessages.listener, { type: 'RUN_UNATTENDED_AUTOMATION', apply: true, expectedAccountId: '/@example' });
+    assert.equal(result.success, false);
+    assert.equal(result.requiresAttention, true);
+    assert.equal(result.classifiedCount, 1);
+    assert.equal(writes, 0);
+  });
+
+  it('skips the reorder call entirely when the validated order is already current', async () => {
+    const videos = [{ id: 'a', setVideoId: 'A', title: 'A', unavailable: false }];
+    let writes = 0;
+    const loc = { href: 'https://www.youtube.com/playlist?list=WL#wl-organizer-automation', pathname: '/not-playlist', search: '?list=WL', hash: '#wl-organizer-automation' };
+    const { runtimeMessages } = loadPanelWithStubs({
+      sendMessage: async message => message.type === 'ANALYZE' ? { success: true, sortOrder: videos, classifiedCount: 0 } : { success: true },
+      enrich: async () => {}, videos, location: loc, document: accountDocument(),
+      readSnapshot: async () => ({ videos, complete: true, diagnostics: { pageCount: 1 } }),
+      applyOrder: async () => { writes++; return { applied: true, moveCount: 1 }; },
+    });
+    loc.pathname = '/playlist';
+    const result = await invoke(runtimeMessages.listener, { type: 'RUN_UNATTENDED_AUTOMATION', apply: true, expectedAccountId: '/@example' });
+    assert.equal(result.success, true);
+    assert.equal(result.alreadyOrdered, true);
+    assert.equal(writes, 0);
+  });
+
+  it('stores a recovery backup before invoking the mocked reorder and reports verified persistence', async () => {
+    const a = { id: 'a', setVideoId: 'A', title: 'A', unavailable: false };
+    const b = { id: 'b', setVideoId: 'B', title: 'B', unavailable: false };
+    const videos = [a, b]; const target = [b, a]; const backups = []; const events = [];
+    const loc = { href: 'https://www.youtube.com/playlist?list=WL#wl-organizer-automation', pathname: '/not-playlist', search: '?list=WL', hash: '#wl-organizer-automation' };
+    const { runtimeMessages } = loadPanelWithStubs({
+      sendMessage: async message => message.type === 'ANALYZE' ? { success: true, sortOrder: target, classifiedCount: 1 } : { success: true, enabled: true, authorized: true, accountId: '/@example', mode: 'scheduled' },
+      enrich: async () => {}, videos, location: loc, document: accountDocument(),
+      readSnapshot: async () => ({ videos, complete: true, diagnostics: { pageCount: 1 } }),
+      ensureManual: async () => 'manual',
+      setUndo: async value => { backups.push(value); events.push(`backup:${value.status}`); },
+      applyOrder: async (_playlistId, order, options) => { events.push('write'); assert.deepEqual(order, ['B', 'A']); assert.deepEqual(options.originalOrder, ['A', 'B']); return { applied: true, moveCount: 1, waitedMs: 25 }; },
+    });
+    loc.pathname = '/playlist';
+    const result = await invoke(runtimeMessages.listener, { type: 'RUN_UNATTENDED_AUTOMATION', apply: true, expectedAccountId: '/@example' });
+    assert.equal(result.success, true);
+    assert.equal(result.applied, true);
+    assert.deepEqual(events, ['backup:pending', 'write', 'backup:verified']);
+    assert.deepEqual(backups[0].previous, ['A', 'B']);
   });
 });
 
@@ -438,18 +510,19 @@ describe('applySort — post-sort reload', () => {
     let scheduledFn;
 
     const WLPanel = loadPanel({
-      WLPlaylist: { applyOrder: async () => ({ applied: true, waitedMs: 1200 }) },
+      WLPlaylist: { readSnapshot: async () => ({ videos: [{ setVideoId: 'A' }], complete: true }), applyOrder: async () => ({ applied: true, waitedMs: 1200 }) },
       WLHeadings: {
         boundariesFrom: () => [],
         hashIds: () => 'hash',
         watch() {}, stop() {}, clear() {},
       },
-      WLStorage: { setGroupMap: async () => {}, getGroupMap: async () => ({}) },
+      WLStorage: { setGroupMap: async () => {}, getGroupMap: async () => ({}), setUndo: async () => {} },
       location: { ...locationStub, reload: () => { reloaded = true; } },
       setTimeout: (fn) => { scheduledFn = fn; return 1; },
     });
     WLPanel.currentSortOrder = [{ id: 'a', setVideoId: 'A' }];
     WLPanel.currentPlaylistId = 'WL';
+    WLPanel.currentCanApply = true;
 
     await WLPanel.applySort();
     assert.ok(scheduledFn, 'setup: applySort must schedule a reload timer');
@@ -506,7 +579,7 @@ describe('applySort — group map persistence', () => {
     const headingCalls = [];
 
     const WLPanel = loadPanel({
-      WLPlaylist: { applyOrder: async () => ({ applied: true, waitedMs: 1200 }) },
+      WLPlaylist: { readSnapshot: async () => ({ videos: [{ setVideoId: 'A' }], complete: true }), applyOrder: async () => ({ applied: true, waitedMs: 1200 }) },
       WLHeadings: {
         boundariesFrom: () => [],
         hashIds: () => 'hash',
@@ -517,12 +590,14 @@ describe('applySort — group map persistence', () => {
       WLStorage: {
         setGroupMap: async (map) => { stored.push(map); },
         getGroupMap: async () => ({}),
+        setUndo: async () => {},
       },
       location: { ...locationStub, reload: () => {} },
       setTimeout: (fn) => { fn(); return 0; },
     });
     WLPanel.currentSortOrder = [{ id: 'a', setVideoId: 'A', duration: 60 }];
     WLPanel.currentPlaylistId = 'WL';
+    WLPanel.currentCanApply = true;
 
     // Loading the module runs onPageChange('load-time'), and locationStub is
     // not a playlist URL, so syncTrigger's not-a-playlist-page branch already
@@ -705,7 +780,7 @@ describe('restoreHeadings', () => {
           getGroupMap: async () => { throw new Error('storage broken'); },
           setGroupMap: async () => {},
         },
-        WLPlaylist: { read: async () => { throw new Error('must not be called'); } },
+      WLPlaylist: { read: async () => { throw new Error('must not be called'); } },
         WLHeadings: {
           boundariesFrom: () => [],
           hashIds: () => 'x',
@@ -943,6 +1018,52 @@ describe('sort options plumbing', () => {
     assert.equal(modalCalls.showPreviewOptions[0], null);
   });
 
+  it('shows the incomplete-read warning and prevents Apply for an unverified preview', async () => {
+    const { WLPanel, modalCalls } = loadPanelWithStubs({
+      sendMessage: async () => ({ success: true, sortOrder: [] }),
+      videos: [{ id: 'a', setVideoId: 'A', duration: 60, percentWatched: 0 }],
+      readSnapshot: async () => ({ videos: [{ id: 'a', setVideoId: 'A', duration: 60, percentWatched: 0 }], complete: false }),
+    });
+    await WLPanel.runSort('duration');
+    assert.equal(modalCalls.showPreviewMeta[0].canApply, false);
+    assert.match(modalCalls.showPreviewMeta[0].warning, /completeness could not be verified/);
+  });
+
+  it('automatically applies only a complete changed order when explicitly requested', async () => {
+    const source = [
+      { id: 'a', setVideoId: 'A', title: 'A', duration: 10, percentWatched: 0 },
+      { id: 'b', setVideoId: 'B', title: 'B', duration: 20, percentWatched: 0 },
+    ];
+    const writes = [];
+    const { WLPanel } = loadPanelWithStubs({
+      videos: source,
+      enrich: async () => {},
+      readSnapshot: async () => ({ videos: source, complete: true }),
+      sendMessage: async (message) => message.type === 'AUTO_PREVIEW_STATUS'
+        ? { autoOrganize: true, manualDryRunCompleted: true }
+        : { success: true, sortOrder: [source[1], source[0]], subjects: [] },
+      applyOrder: async (...args) => { writes.push(args); return { applied: true, waitedMs: 0 }; },
+      reload: () => {},
+      runTimers: true,
+    });
+    await WLPanel.runSort('ai', { automatic: true, applyAutomatically: true });
+    assert.equal(writes.length, 1);
+  });
+
+  it('keeps automatic organisation preview-only when completeness is unverified', async () => {
+    const source = [{ id: 'a', setVideoId: 'A', title: 'A', duration: 10, percentWatched: 0 }];
+    let writes = 0;
+    const { WLPanel } = loadPanelWithStubs({
+      videos: source,
+      enrich: async () => {},
+      readSnapshot: async () => ({ videos: source, complete: false, reason: 'Count mismatch.' }),
+      sendMessage: async () => ({ success: true, sortOrder: source, subjects: [] }),
+      applyOrder: async () => { writes++; return { applied: true, waitedMs: 0 }; },
+    });
+    await WLPanel.runSort('ai', { automatic: true, applyAutomatically: true });
+    assert.equal(writes, 0);
+  });
+
   it('changeSortOptions sends RESORT with sortOptions and no overrides key, then persists what came back', async () => {
     const sent = [];
     const saved = [];
@@ -1146,7 +1267,7 @@ describe('undo', () => {
   const order = [{ id: 'a', setVideoId: 'A' }, { id: 'b', setVideoId: 'B' }];
   const read = [{ id: 'b', setVideoId: 'B' }, { id: 'a', setVideoId: 'A' }];
 
-  it('applySort stores the order read right before the write, after the Manual switch', async () => {
+  it('stores a pending backup before the write and marks it verified after read-back succeeds', async () => {
     const saved = [];
     const events = [];
     const { WLPanel } = loadPanelWithStubs({
@@ -1161,14 +1282,16 @@ describe('undo', () => {
       playlistId: 'WL',
     });
     await WLPanel.applySort();
-    assert.equal(saved.length, 1);
+    assert.equal(saved.length, 2);
     assert.deepEqual(saved[0].previous, ['B', 'A']);
     assert.deepEqual(saved[0].current, ['A', 'B']);
     assert.equal(saved[0].playlistId, 'WL');
+    assert.equal(saved[0].status, 'pending');
+    assert.equal(saved.at(-1).status, 'verified');
     assert.deepEqual(events, ['ensureManual', 'applyOrder']);
   });
 
-  it('applySort clears the undo state when the write never reads back', async () => {
+  it('retains the backup but disables Undo when the write does not verify', async () => {
     const saved = [];
     const { WLPanel, modalCalls } = loadPanelWithStubs({
       sendMessage: async () => ({ success: true }),
@@ -1179,11 +1302,12 @@ describe('undo', () => {
       playlistId: 'WL',
     });
     await WLPanel.applySort();
-    assert.deepEqual(saved, [{}], 'an older undo record would restore the wrong order');
+    assert.equal(saved.at(-1).status, 'not-applied');
+    assert.deepEqual(saved[0].previous, ['B', 'A'], 'the original sequence is saved before the write');
     assert.equal(modalCalls.showError.length, 1);
   });
 
-  it('applySort clears the undo state when the previous order could not be read', async () => {
+  it('retains any existing backup when the current playlist cannot be validated', async () => {
     const originalWarn = console.warn;
     console.warn = () => {};
     try {
@@ -1191,6 +1315,9 @@ describe('undo', () => {
       const { WLPanel } = loadPanelWithStubs({
         sendMessage: async () => ({ success: true }),
         ensureManual: async () => 'switched',
+        // The permanent reorder safety check must stop before writing without
+        // a validated current snapshot. Existing backups are left untouched.
+        readSnapshot: async () => { throw new Error('playlist read failed'); },
         applyOrder: async () => ({ applied: true, waitedMs: 1 }),
         setUndo: async (state) => { saved.push({ ...state }); },
         reload: () => {},
@@ -1198,9 +1325,8 @@ describe('undo', () => {
         sortOrder: order,
         playlistId: 'WL',
       });
-      // videos undefined → WLPlaylist.read resolves undefined → .map throws
       await WLPanel.applySort();
-      assert.deepEqual(saved, [{}]);
+      assert.deepEqual(saved, []);
     } finally {
       console.warn = originalWarn;
     }
@@ -1217,8 +1343,9 @@ describe('undo', () => {
     });
     await load({ playlistId: 'WL', previous: ['A'], current: ['A'] }).openModal();
     await load({ playlistId: 'PLother', previous: ['A'], current: ['A'] }).openModal();
+    await load({ playlistId: 'WL', previous: ['A'], current: ['A'], status: 'uncertain' }).openModal();
     await load({}).openModal();
-    assert.deepEqual(opened, [true, false, false]);
+    assert.deepEqual(opened, [true, false, false, false]);
   });
 
   it('openModal offers Clear headings whenever headings are stored, shown or hidden', async () => {
@@ -1309,7 +1436,7 @@ describe('undo', () => {
     assert.match(modalCalls.showError[0], /changed since/);
   });
 
-  it('undoSort refuses when the playlist entries changed since the sort, and drops the state', async () => {
+  it('undoSort refuses when entries changed and marks the retained backup stale', async () => {
     let wrote = false;
     const cleared = [];
     const { WLPanel, modalCalls } = loadPanelWithStubs({
@@ -1321,7 +1448,7 @@ describe('undo', () => {
     });
     await WLPanel.undoSort();
     assert.equal(wrote, false);
-    assert.deepEqual(cleared, [{}]);
+    assert.deepEqual(cleared, [{ playlistId: 'WL', previous: ['B', 'A'], current: ['A', 'B'], status: 'stale' }]);
     assert.match(modalCalls.showError[0], /changed since/);
   });
 

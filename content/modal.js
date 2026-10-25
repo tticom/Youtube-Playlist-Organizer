@@ -21,10 +21,19 @@ const WLModal = {
       { value: 'duration-desc', label: 'Longest first' },
       { value: 'playlist', label: 'Playlist order' },
       { value: 'title', label: 'Title A–Z' },
+      { value: 'title-desc', label: 'Title Z–A' },
+    ],
+    secondaryWithinGroup: [
+      { value: 'playlist', label: 'Original playlist position' },
+      { value: 'duration-asc', label: 'Duration shortest first' },
+      { value: 'duration-desc', label: 'Duration longest first' },
+      { value: 'title', label: 'Title A–Z' },
+      { value: 'title-desc', label: 'Title Z–A' },
     ],
     inProgress: [
       { value: 'top', label: 'Own group on top' },
       { value: 'within', label: 'Inside their category' },
+      { value: 'sort', label: 'Follow selected sort' },
     ],
     groupOrder: [
       { value: 'taxonomy', label: 'My category order' },
@@ -42,12 +51,11 @@ const WLModal = {
   ],
   SORT_FIELD_LABELS: {
     withinGroup: 'Within a group',
+    secondaryWithinGroup: 'Then sort by',
     inProgress: 'Group in progress',
     groupOrder: 'Group order',
   },
-  // inProgress has exactly two values, so it renders as a switch: on is 'top',
-  // off is 'within'.
-  SORT_CHECKBOX_VALUES: { inProgress: { on: 'top', off: 'within' } },
+  SORT_CHECKBOX_VALUES: {},
   // Collapsed by default; remembered for the life of the page so a re-render
   // after a change does not fold the panel the user just opened.
   _sortOptionsOpen: false,
@@ -63,6 +71,7 @@ const WLModal = {
   _root: null,
   _lastFocused: null,
   _handlers: {},
+  _subjects: [],
   _keyHandler: null,
 
   /**
@@ -430,12 +439,13 @@ const WLModal = {
    * `sortOptions` is the set the order was built with; when given, the option
    * selects render above the list. Duration mode passes none and gets no row.
    */
-  showPreview(sortOrder, sortOptions = null) {
+  showPreview(sortOrder, sortOptions = null, subjects = this._subjects, { warning = null, canApply = true, diagnostics = null } = {}) {
     const body = this._body();
     const footer = this._footer();
     if (!body) return;
 
     this._cancellable = true;
+    this._subjects = subjects || [];
 
     // A re-render triggered by one of the controls must not steal focus from it:
     // arrow keys on a focused radio fire `change` per step, and jumping to Apply
@@ -449,6 +459,39 @@ const WLModal = {
     this.setStatus('');
     body.textContent = '';
     footer.textContent = '';
+
+    if (warning) {
+      const notice = document.createElement('p');
+      notice.className = 'wl-hint wl-retrieval-warning';
+      notice.setAttribute('role', 'status');
+      notice.textContent = warning;
+      body.appendChild(notice);
+    }
+
+    if (diagnostics) {
+      const details = document.createElement('details');
+      details.className = 'wl-retrieval-diagnostics';
+      const summary = document.createElement('summary');
+      summary.textContent = 'Playlist retrieval diagnostics';
+      const list = document.createElement('dl');
+      const rows = [
+        ['Header count', diagnostics.headerCount ?? 'Unavailable'],
+        ['Rendered header count', diagnostics.renderedHeaderCount ?? 'Unavailable'],
+        ['Retrieved entries', diagnostics.retrievedEntryCount],
+        ['Distinct reorderable entries', diagnostics.distinctReorderableEntryCount],
+        ['Pages read', diagnostics.pageCount],
+        ['Pagination terminated', diagnostics.paginationTerminated ? 'Yes' : 'No'],
+        ['Completeness verification', diagnostics.completenessVerified ? 'Passed' : 'Not verified'],
+        ['Outcome', diagnostics.outcome || 'Not verified'],
+      ];
+      for (const [label, value] of rows) {
+        const term = document.createElement('dt'); term.textContent = label;
+        const description = document.createElement('dd'); description.textContent = String(value);
+        list.append(term, description);
+      }
+      details.append(summary, list);
+      body.appendChild(details);
+    }
 
     if (sortOptions) {
       const row = this._renderSortOptions(sortOptions);
@@ -490,6 +533,8 @@ const WLModal = {
     apply.className = 'wl-modal-btn wl-primary';
     apply.type = 'button';
     apply.textContent = 'Apply Sort';
+    apply.disabled = !canApply;
+    if (!canApply) apply.title = 'Permanent reorder is disabled because playlist completeness is unverified.';
     apply.addEventListener('click', () => this._handlers.onApply?.());
 
     const cancel = document.createElement('button');
@@ -670,6 +715,44 @@ const WLModal = {
     meta.textContent = this.metaFor(video);
 
     row.appendChild(title);
+
+    if ('cluster' in video && this._subjects.length && !video.unavailable) {
+      const select = document.createElement('select');
+      select.className = 'wl-classification-override';
+      select.setAttribute('aria-label', `Classification for ${video.title}`);
+      const automatic = document.createElement('option');
+      automatic.value = '';
+      automatic.textContent = `Automatic · ${video.cluster || 'Other'}`;
+      automatic.selected = !video.manualOverride;
+      select.appendChild(automatic);
+      for (const subject of this._subjects) {
+        const option = document.createElement('option');
+        option.value = subject.id;
+        option.textContent = subject.name;
+        option.selected = video.manualOverride && subject.name === video.cluster;
+        select.appendChild(option);
+      }
+      select.addEventListener('change', () => this._handlers.onClassificationOverride?.(video.id, select.value));
+      row.appendChild(select);
+      const reason = document.createElement('span'); reason.className = 'wl-item-meta';
+      reason.textContent = video.classificationEvidence?.length
+        ? `Why: ${video.classificationEvidence.map(e => `${e.field} “${e.phrase}”`).join(', ')}`
+        : (video.classificationSource ? `Assigned by ${video.classificationSource}${video.classificationUncertain ? ' · uncertain' : ''}` : '');
+      if (reason.textContent) row.appendChild(reason);
+      if (!video.manualOverride) {
+        const confirm = document.createElement('button'); confirm.type = 'button'; confirm.className = 'wl-unwatch-btn'; confirm.textContent = video.classificationConfirmed ? 'Confirmed' : 'Confirm'; confirm.disabled = Boolean(video.classificationConfirmed);
+        confirm.addEventListener('click', () => this._handlers.onClassificationFeedback?.(video.id, { confirmed: true }));
+        const uncertain = document.createElement('button'); uncertain.type = 'button'; uncertain.className = 'wl-unwatch-btn'; uncertain.textContent = 'Uncertain';
+        uncertain.addEventListener('click', () => this._handlers.onClassificationFeedback?.(video.id, { uncertain: true }));
+        row.append(confirm, uncertain);
+      }
+      const explain = document.createElement('details');
+      const summary = document.createElement('summary'); summary.textContent = 'Add feedback note';
+      const note = document.createElement('input'); note.placeholder = 'Optional correction or classification note'; note.setAttribute('aria-label', `Feedback note for ${video.title}`);
+      const saveFeedback = document.createElement('button'); saveFeedback.type = 'button'; saveFeedback.textContent = 'Save note';
+      saveFeedback.addEventListener('click', () => this._handlers.onClassificationFeedback?.(video.id, { explanation: note.value, confirmed: true }));
+      explain.append(summary, note, saveFeedback); row.appendChild(explain);
+    }
 
     // Only an AI order carries `cluster`; the simple sorts have no cached
     // analysis for the toggle's RESORT to recompute against.

@@ -50,6 +50,13 @@ describe('buildPrompt', () => {
     assert.ok(!prompt.includes('Music'));
   });
 
+  it('includes both subject descriptions and explicit classification instructions', () => {
+    const prompt = buildPrompt([video()], {
+      subjects: [{ id: 'custom:physics', name: 'Physics', description: 'Physical sciences.', instructions: 'Prefer this to general science when relevant.' }],
+    });
+    assert.ok(prompt.includes('- Physics: Physical sciences. Classification instructions: Prefer this to general science when relevant.'));
+  });
+
   it('appends extra instructions only when non-empty', () => {
     const withExtra = buildPrompt([video()], { extraInstructions: 'Keep cooking and baking separate' });
     assert.ok(withExtra.includes('Additional instructions from the user:\nKeep cooking and baking separate'));

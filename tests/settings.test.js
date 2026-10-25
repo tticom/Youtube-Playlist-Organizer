@@ -26,13 +26,21 @@ function fakeSync(initial = {}) {
 describe('DEFAULT_SETTINGS', () => {
   it('starts on Anthropic with the built-in taxonomy and no key', () => {
     assert.equal(DEFAULT_SETTINGS.provider, 'anthropic');
+    assert.equal(DEFAULT_SETTINGS.autoPreviewWatchLater, false);
     assert.equal(DEFAULT_SETTINGS.apiKey, '');
+    assert.equal(DEFAULT_SETTINGS.classificationMethod, 'local-rules');
     assert.deepEqual(DEFAULT_SETTINGS.taxonomy, TAXONOMY);
     assert.equal(DEFAULT_SETTINGS.maxNewCategories, 2);
+    assert.equal(DEFAULT_SETTINGS.autoOrganizeWatchLater, false);
   });
 });
 
 describe('normalizeSettings', () => {
+  it('defaults new configurations to local rules and keeps legacy configured providers on their previous AI path', () => {
+    assert.equal(normalizeSettings({}).classificationMethod, 'local-rules');
+    assert.equal(normalizeSettings({ provider: 'openai', apiKey: 'legacy' }).classificationMethod, 'cloud-ai');
+    assert.equal(normalizeSettings({ classificationMethod: 'local-ai' }).classificationMethod, 'local-ai');
+  });
   it('fills every default from an empty object, resolving URL and model from the provider', () => {
     const s = normalizeSettings({});
     assert.equal(s.provider, 'anthropic');
@@ -40,6 +48,8 @@ describe('normalizeSettings', () => {
     assert.equal(s.model, 'claude-haiku-4-5-20251001');
     assert.deepEqual(s.taxonomy, TAXONOMY);
     assert.equal(s.extraInstructions, '');
+    assert.equal(s.autoOrganizeWatchLater, false);
+    assert.equal(normalizeSettings({ autoOrganizeWatchLater: true }).autoOrganizeWatchLater, true);
   });
 
   it('tolerates garbage input', () => {
@@ -156,7 +166,7 @@ describe('settings.sort', () => {
 
   it('keeps whitelisted values and drops anything else back to the default', () => {
     const s = normalizeSettings({ sort: { withinGroup: 'title', inProgress: 'nope', groupOrder: 'size' } });
-    assert.deepEqual(s.sort, { withinGroup: 'title', inProgress: 'top', groupOrder: 'size' });
+    assert.deepEqual(s.sort, { withinGroup: 'title', secondaryWithinGroup: 'playlist', inProgress: 'top', groupOrder: 'size' });
     assert.deepEqual(normalizeSettings({ sort: 'garbage' }).sort, SORT_DEFAULTS);
   });
 

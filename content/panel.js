@@ -7,6 +7,10 @@ const WLPanel = {
   currentSortOrder: [],
   currentPlaylistId: null,
   currentSortOptions: null,
+  currentSubjects: [],
+  currentReadWarning: null,
+  currentReadDiagnostics: null,
+  currentCanApply: false,
   // The mode of the run that produced currentSortOrder; only 'ai' has a cached
   // analysis for RESORT to work from.
   currentMode: null,
@@ -24,7 +28,7 @@ const WLPanel = {
     let canUndo = false;
     try {
       const undo = await WLStorage.getUndo();
-      canUndo = Array.isArray(undo.previous) && undo.playlistId === playlistId;
+      canUndo = Array.isArray(undo.previous) && undo.playlistId === playlistId && (!undo.status || undo.status === 'verified');
     } catch (err) {
       console.warn('WLPanel: failed to read the undo state', err);
     }
@@ -38,6 +42,8 @@ const WLPanel = {
       onCancel: () => { this._runId++; this.currentSortOrder = []; this.currentMode = null; },
       onToggleUnwatched: (videoId) => this.toggleUnwatched(videoId),
       onSortOptionsChange: (sortOptions) => this.changeSortOptions(sortOptions),
+      onClassificationOverride: (videoId, subjectId) => this.changeClassification(videoId, subjectId),
+      onClassificationFeedback: (videoId, feedback) => this.recordClassificationFeedback(videoId, feedback),
     }, { canUndo, hasHeadings: this._headingsState !== null });
   },
 
@@ -125,7 +131,7 @@ const WLPanel = {
    * The non-AI modes sort locally and never call the model — no API key
    * needed, and they skip enrichment since nothing consumes the metadata.
    */
-  async runSort(mode) {
+  async runSort(mode, { automatic = false, applyAutomatically = false } = {}) {
     const runId = ++this._runId;
     this.currentMode = mode;
 
@@ -135,8 +141,14 @@ const WLPanel = {
       this.currentPlaylistId = playlistId;
 
       WLModal.showBusy('Reading playlist...');
-      const videos = await WLPlaylist.read(playlistId);
+      const snapshot = await WLPlaylist.readSnapshot(playlistId);
+      const videos = snapshot.videos;
       if (runId !== this._runId) return;
+      this.currentCanApply = snapshot.complete === true;
+      this.currentReadDiagnostics = snapshot.diagnostics || null;
+      this.currentReadWarning = snapshot.complete
+        ? null
+        : `${snapshot.reason || 'Playlist completeness could not be verified.'} ${snapshot.expectedCount == null ? '' : `Retrieved ${snapshot.uniqueEntryCount} of ${snapshot.expectedCount}. `}Apply is disabled.`;
 
       if (!videos || videos.length === 0) {
         WLModal.showError('No videos found on this playlist.');
@@ -149,8 +161,8 @@ const WLPanel = {
         await WLEnrich.enrich(videos);
         if (runId !== this._runId) return;
 
-        WLModal.showBusy('Categorizing with AI...');
-        result = await chrome.runtime.sendMessage({ type: 'ANALYZE', videos, playlistId });
+        WLModal.showBusy('Classifying videos...');
+        result = await chrome.runtime.sendMessage({ type: 'ANALYZE', videos, playlistId, manualPreview: !automatic });
       } else {
         WLModal.showBusy(`Sorting by ${mode}...`);
         result = await chrome.runtime.sendMessage({ type: 'SORT_BY_DURATION', videos, by: mode });
@@ -161,7 +173,17 @@ const WLPanel = {
 
       this.currentSortOrder = result.sortOrder;
       this.currentSortOptions = result.sortOptions ?? null;
-      WLModal.showPreview(result.sortOrder, this.currentSortOptions);
+      this.currentSubjects = result.subjects || [];
+      WLModal.showPreview(result.sortOrder, this.currentSortOptions, this.currentSubjects, { warning: this.currentReadWarning, canApply: this.currentCanApply, diagnostics: this.currentReadDiagnostics });
+      if (applyAutomatically && this.currentCanApply) {
+        const originalIds = videos.map(video => video.setVideoId);
+        const orderedIds = result.sortOrder.map(video => video.setVideoId);
+        if (originalIds.length === orderedIds.length && originalIds.every((id, index) => id === orderedIds[index])) {
+          WLModal.setStatus('Watch Later is already in the configured order. No changes were made.');
+        } else {
+          await this.applySort({ automatic: true });
+        }
+      }
     } catch (err) {
       if (runId === this._runId) WLModal.showError(err.message);
     }
@@ -199,7 +221,7 @@ const WLPanel = {
 
       this.currentSortOrder = result.sortOrder;
       this.currentSortOptions = result.sortOptions ?? this.currentSortOptions;
-      WLModal.showPreview(result.sortOrder, this.currentSortOptions);
+      WLModal.showPreview(result.sortOrder, this.currentSortOptions, this.currentSubjects, { warning: this.currentReadWarning, canApply: this.currentCanApply, diagnostics: this.currentReadDiagnostics });
     } catch (err) {
       // The modal invokes this fire-and-forget, so an uncaught rejection here
       // is invisible to the user — the everyday trigger is "Extension context
@@ -218,6 +240,7 @@ const WLPanel = {
    */
   async changeSortOptions(sortOptions) {
     if (this.currentMode !== 'ai') return;
+    if (sortOptions.withinGroup && sortOptions.withinGroup !== this.currentSortOptions?.withinGroup) chrome.runtime.sendMessage({ type: 'RECORD_SORTING_CHOICE', field: sortOptions.withinGroup, group: '*' }).catch(() => {});
     const runId = this._runId;
     // Firefox fires `change` per arrow-key step, so replies can arrive out of
     // order; only the newest request may paint or persist.
@@ -234,7 +257,7 @@ const WLPanel = {
 
       this.currentSortOrder = result.sortOrder;
       this.currentSortOptions = result.sortOptions ?? sortOptions;
-      WLModal.showPreview(result.sortOrder, this.currentSortOptions);
+      WLModal.showPreview(result.sortOrder, this.currentSortOptions, this.currentSubjects, { warning: this.currentReadWarning, canApply: this.currentCanApply, diagnostics: this.currentReadDiagnostics });
 
       // The preview is already correct; failing to remember the choice for next
       // time is not worth an error state in the modal.
@@ -255,7 +278,33 @@ const WLPanel = {
    * @returns {{ result, viewSort, previous } | null} null when superseded or
    *   when the write threw (already shown as an error).
    */
-  async _writeOrder(runId, playlistId, ordered) {
+  async changeClassification(videoId, subjectId) {
+    if (this.currentMode !== 'ai') return;
+    const runId = this._runId;
+    WLModal.setStatus('Updating classification...');
+    try {
+      const result = await chrome.runtime.sendMessage({ type: 'SET_CLASSIFICATION_OVERRIDE', videoId, subjectId, playlistId: this.currentPlaylistId });
+      if (runId !== this._runId) return;
+      if (!result.success) { WLModal.showError(result.error); return; }
+      this.currentSortOrder = result.sortOrder;
+      WLModal.showPreview(result.sortOrder, this.currentSortOptions, this.currentSubjects, { warning: this.currentReadWarning, canApply: this.currentCanApply, diagnostics: this.currentReadDiagnostics });
+    } catch (err) {
+      if (runId === this._runId) WLModal.showError(err.message);
+    }
+  },
+
+  async recordClassificationFeedback(videoId, feedback) {
+    try {
+      const result = await chrome.runtime.sendMessage({ type: 'CLASSIFICATION_FEEDBACK', videoId, ...feedback });
+      if (!result?.success) { WLModal.showError(result?.error || 'Could not save classification feedback.'); return; }
+      const item = this.currentSortOrder.find(video => video.id === videoId);
+      if (item) { if ('confirmed' in feedback) item.classificationConfirmed = feedback.confirmed; if ('uncertain' in feedback) item.classificationUncertain = feedback.uncertain; }
+      WLModal.showPreview(this.currentSortOrder, this.currentSortOptions, this.currentSubjects, { warning: this.currentReadWarning, canApply: this.currentCanApply, diagnostics: this.currentReadDiagnostics });
+      WLModal.setStatus(feedback.uncertain ? 'Marked uncertain; preference saved locally.' : 'Classification feedback saved locally.');
+    } catch (err) { WLModal.showError(err.message); }
+  },
+
+  async _writeOrder(runId, playlistId, ordered, { saveBackup = true } = {}) {
     // The reorder only shows through the Manual view (content/viewsort.js).
     // Still cancellable: nothing has been written yet.
     WLModal.showBusy('Checking the playlist sort...');
@@ -273,13 +322,31 @@ const WLPanel = {
     WLModal.showBusy('Reading playlist...');
     let previous;
     try {
-      const videos = await WLPlaylist.read(playlistId);
-      previous = videos.map(v => v.setVideoId);
+      const snapshot = await WLPlaylist.readSnapshot(playlistId);
+      if (!snapshot.complete) throw new Error(snapshot.reason);
+      previous = snapshot.videos.map(v => v.setVideoId);
     } catch (err) {
-      console.warn('WLPanel: could not read the order before writing; Undo will be unavailable', err);
-      previous = null;
+      WLModal.showError(`Cannot safely reorder this playlist: ${err.message}`);
+      return null;
     }
     if (runId !== this._runId) return null;
+
+    // Keep a restorable snapshot durably before the first remote mutation.
+    if (saveBackup) {
+      try {
+        await WLStorage.setUndo({ playlistId, previous, current: ordered, status: 'pending' });
+      } catch (err) {
+        WLModal.showError(`Cannot safely reorder this playlist because its backup could not be saved: ${err.message}`);
+        return null;
+      }
+    }
+    if (runId !== this._runId) {
+      if (saveBackup) {
+        try { await WLStorage.setUndo({ playlistId, previous, current: ordered, status: 'not-applied' }); }
+        catch (err) { console.warn('WLPanel: could not mark a cancelled reorder backup', err); }
+      }
+      return null;
+    }
 
     // Uninterruptible from here: applyOrder() sends the reorder immediately, so
     // "cancelling" would only hide the modal and skip the reload while the
@@ -288,32 +355,40 @@ const WLPanel = {
 
     let result;
     try {
-      result = await WLPlaylist.applyOrder(playlistId, ordered);
+      result = await WLPlaylist.applyOrder(playlistId, ordered, { complete: true, originalOrder: previous });
     } catch (err) {
+      if (saveBackup) {
+        try { await WLStorage.setUndo({ playlistId, previous, current: ordered, status: 'uncertain' }); }
+        catch (backupErr) { console.warn('WLPanel: failed to mark the retained backup uncertain', backupErr); }
+      } else {
+        try {
+          const prior = await WLStorage.getUndo();
+          if (prior?.playlistId === playlistId && Array.isArray(prior.previous)) await WLStorage.setUndo({ ...prior, status: 'uncertain' });
+        } catch (backupErr) { console.warn('WLPanel: failed to mark the recovery backup uncertain', backupErr); }
+      }
       if (runId === this._runId) WLModal.showError(err.message);
       return null;
+    }
+    if (saveBackup) {
+      try { await WLStorage.setUndo({ playlistId, previous, current: ordered, status: result.applied ? 'verified' : 'not-applied' }); }
+      catch (err) { console.warn('WLPanel: could not update the retained backup status', err); }
     }
     if (runId !== this._runId) return null;
     return { result, viewSort, previous };
   },
 
   /**
-   * The write was sent but never read back, so the playlist's order is
-   * unknown; an older undo record would restore the wrong thing.
+   * Keep the original sequence for recovery, but do not expose Undo until a
+   * later read establishes which sequence is currently stored.
    */
   async _writeNotApplied(runId, viewSort) {
-    try {
-      await WLStorage.setUndo({});
-    } catch (err) {
-      console.warn('WLPanel: failed to clear the undo state', err);
-    }
     if (runId !== this._runId) return;
     // Anything but a confirmed Manual view is the likeliest cause, including
     // a chip the selector no longer finds.
     const manualUnconfirmed = viewSort !== 'manual' && viewSort !== 'switched';
     WLModal.showError(manualUnconfirmed
       ? 'Sort was sent but the new order did not appear. This playlist is not on Manual sort: pick Manual in the sort menu above the list, then try again.'
-      : 'Sort was sent but the new order did not appear. Reload and check the playlist.');
+      : 'YouTube did not confirm the requested order. The original sequence backup was retained, but Undo is unavailable until you inspect the playlist and verify its current order.');
   },
 
   /**
@@ -328,8 +403,16 @@ const WLPanel = {
     setTimeout(() => { if (runId === this._runId) location.reload(); }, 1200);
   },
 
-  async applySort() {
+  async applySort({ automatic = false } = {}) {
     const runId = this._runId;
+    if (automatic) {
+      const status = await chrome.runtime.sendMessage({ type: 'AUTO_PREVIEW_STATUS' }).catch(() => null);
+      if (!status?.autoOrganize || !status.manualDryRunCompleted || runId !== this._runId) return;
+    }
+    if (!this.currentCanApply) {
+      WLModal.showError('Cannot apply this preview because playlist completeness is not verified.');
+      return;
+    }
     const playlistId = this.currentPlaylistId;
     const orderedSetVideoIds = this.currentSortOrder.map(v => v.setVideoId);
 
@@ -340,6 +423,16 @@ const WLPanel = {
     if (!result.applied) {
       await this._writeNotApplied(runId, viewSort);
       return;
+    }
+
+    if (result.moveCount > 0) {
+      const accountId = playlistAccountIdentity();
+      if (accountId) await chrome.runtime.sendMessage({
+        type: 'RECORD_MANUAL_ACCEPTANCE', playlistId, accountId,
+        moveCount: result.moveCount,
+        completenessVerified: this.currentReadDiagnostics?.completenessVerified === true,
+        readbackVerified: result.applied === true,
+      }).catch(err => { console.warn('WLPanel: could not record manual acceptance evidence', err); return null; });
     }
 
     // Persist BEFORE the reload — the reload is what makes headings necessary,
@@ -374,12 +467,6 @@ const WLPanel = {
     } catch (err) {
       console.warn('WLPanel: failed to persist group map; headings may be stale after reload', err);
     }
-    // Same reasoning: Undo is a convenience over a write that already landed.
-    try {
-      await WLStorage.setUndo(previous ? { playlistId, previous, current: orderedSetVideoIds } : {});
-    } catch (err) {
-      console.warn('WLPanel: failed to persist the undo state', err);
-    }
     // Re-check ownership: the awaits above are a window resetForNavigation()'s
     // synchronous _runId bump can land in, same as every other await in this
     // method. Without this, a navigate-away mid-persist would still announce
@@ -411,7 +498,13 @@ const WLPanel = {
         WLModal.showError('Nothing to undo for this playlist.');
         return;
       }
-      videos = await WLPlaylist.read(playlistId);
+      if (undo.status && undo.status !== 'verified') {
+        WLModal.showError('A backup is retained, but the previous reorder was not verified. Inspect the playlist before attempting recovery.');
+        return;
+      }
+      const snapshot = await WLPlaylist.readSnapshot(playlistId);
+      if (!snapshot.complete) throw new Error(snapshot.reason);
+      videos = snapshot.videos;
     } catch (err) {
       if (runId === this._runId) WLModal.showError(err.message);
       return;
@@ -422,17 +515,14 @@ const WLPanel = {
       && videos.length === undo.current.length
       && videos.every((v, i) => v.setVideoId === undo.current[i]);
     if (!unchanged) {
-      try {
-        await WLStorage.setUndo({});
-      } catch (err) {
-        console.warn('WLPanel: failed to clear a stale undo state', err);
-      }
+      try { await WLStorage.setUndo({ ...undo, status: 'stale' }); }
+      catch (err) { console.warn('WLPanel: failed to mark the retained backup stale', err); }
       if (runId === this._runId) {
         WLModal.showError('The playlist has changed since that sort, so it cannot be undone.');
       }
       return;
     }
-    const written = await this._writeOrder(runId, playlistId, undo.previous);
+    const written = await this._writeOrder(runId, playlistId, undo.previous, { saveBackup: false });
     if (!written) return;
     const { result, viewSort } = written;
 
@@ -539,6 +629,9 @@ const WL_LOG = '[WL]';
 // `undefined` initially guarantees the very first call always looks like a
 // transition and gets logged.
 let lastOnPlaylistPage;
+let lastPlaylistId;
+let automaticPreviewTimer = null;
+let automaticPreviewRunning = false;
 
 /**
  * The trigger is a fixed-position element we own, so there is no YouTube
@@ -566,7 +659,10 @@ function syncTrigger(source) {
   }
 
   const stateChanged = onPage !== lastOnPlaylistPage;
+  const playlistId = onPage ? new URL(location.href).searchParams.get('list') : null;
+  const playlistChanged = playlistId !== lastPlaylistId;
   lastOnPlaylistPage = onPage;
+  lastPlaylistId = playlistId;
   const noteworthy = source !== 'observer' || stateChanged;
 
   if (!onPage) {
@@ -598,6 +694,23 @@ function syncTrigger(source) {
   }
 
   WLPanel.checkViewSort();
+  if (playlistId === 'WL' && location.hash !== '#wl-organizer-automation' && (stateChanged || playlistChanged) && !automaticPreviewRunning) {
+    clearTimeout(automaticPreviewTimer);
+    automaticPreviewTimer = setTimeout(async () => {
+      const status = await chrome.runtime.sendMessage({ type: 'AUTO_PREVIEW_STATUS' }).catch(() => null);
+      if (!status?.enabled || (!status.manualDryRunCompleted && !status.autoPreviewAllowed) || !onPlaylistPage() || new URL(location.href).searchParams.get('list') !== 'WL' || automaticPreviewRunning) return;
+      automaticPreviewRunning = true;
+      try {
+        if (status.autoOrganize) {
+          const result = await chrome.runtime.sendMessage({ type: 'AUTOMATION_ON_OPEN' });
+          if (!result?.success) console.warn('[WL] On-open unattended run failed', result?.error || 'No result');
+          return;
+        }
+        await WLPanel.openModal();
+        await WLPanel.runSort('ai', { automatic: true, applyAutomatically: status.autoOrganize === true });
+      } finally { automaticPreviewRunning = false; }
+    }, 900);
+  }
   WLModal.syncHeadingsToggle(WLPanel._headingsState, { onToggle: () => WLPanel.toggleHeadings() });
   WLPanel.restoreHeadings();
 }
@@ -607,6 +720,10 @@ function resetForNavigation() {
   WLPanel.currentSortOrder = [];
   WLPanel.currentPlaylistId = null;
   WLPanel.currentSortOptions = null;
+  WLPanel.currentSubjects = [];
+  WLPanel.currentReadWarning = null;
+  WLPanel.currentReadDiagnostics = null;
+  WLPanel.currentCanApply = false;
   WLPanel.currentMode = null;
   WLModal.close();
   WLInnerTube.resetConfig();
@@ -655,6 +772,78 @@ document.addEventListener('DOMContentLoaded', () => onPageChange('DOMContentLoad
 window.addEventListener('load', () => onPageChange('load'));
 
 onPageChange('load-time');
+
+function playlistAccountIdentity() {
+  const owner = document.querySelector('ytd-playlist-header-renderer #owner a[href], ytd-playlist-header-renderer #owner ytd-channel-name a[href]');
+  const href = owner?.getAttribute('href') || '';
+  return href.startsWith('/@') || href.startsWith('/channel/') ? href.split(/[?#]/)[0] : null;
+}
+
+async function runUnattendedContent(message) {
+  const playlistId = new URL(location.href).searchParams.get('list');
+  const accountId = playlistAccountIdentity();
+  if (location.pathname !== '/playlist' || playlistId !== 'WL') return { success: false, error: 'The automation tab is not Watch Later.' };
+  if (!accountId) return { success: false, requiresAttention: true, error: 'Could not identify the signed-in YouTube account from the Watch Later owner header.' };
+  if (message.expectedAccountId && accountId !== message.expectedAccountId) return { success: false, requiresAttention: true, accountId, error: 'The signed-in YouTube account does not match the account authorized for unattended sorting.' };
+
+  let snapshot;
+  try { snapshot = await WLPlaylist.readSnapshot('WL'); }
+  catch (error) { return { success: false, requiresAttention: /count|complete|duplicate|entry|continuation|page limit/i.test(error.message), accountId, error: error.message }; }
+  const diagnostics = snapshot.diagnostics || {};
+  if (!snapshot.videos.length) return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: snapshot.complete === true, error: snapshot.complete ? 'The validated playlist was empty; refusing unattended sorting.' : (snapshot.reason || 'Playlist completeness could not be verified; refusing to write.') };
+
+  try {
+    await WLEnrich.enrich(snapshot.videos);
+    const analysis = await chrome.runtime.sendMessage({ type: 'ANALYZE', videos: snapshot.videos, playlistId: 'WL', manualPreview: false });
+    if (!analysis?.success) return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: analysis?.error || 'Classification failed.' };
+    if (!snapshot.complete) return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: false, classifiedCount: analysis.classifiedCount || 0, error: snapshot.reason || 'Playlist completeness could not be verified; classification was saved but no write was attempted.', preview: analysis.sortOrder.map(video => ({ title: video.title, subject: video.cluster || video.category || '' })) };
+    const target = analysis.sortOrder.map(video => video.setVideoId);
+    const original = snapshot.videos.map(video => video.setVideoId);
+    if (target.length !== original.length || new Set(target).size !== target.length || original.some(id => !target.includes(id))) return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: 'Calculated order does not preserve every distinct playlist entry.' };
+    const alreadyOrdered = target.every((id, index) => id === original[index]);
+    if (alreadyOrdered || message.apply !== true) return { success: true, previewOnly: message.apply !== true, alreadyOrdered, applied: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, classifiedCount: analysis.classifiedCount || 0, moveCount: 0, preview: analysis.sortOrder.map(video => ({ title: video.title, subject: video.cluster || video.category || '' })) };
+
+    const permit = await chrome.runtime.sendMessage({ type: 'GET_AUTOMATION_PERMIT' });
+    if (!permit?.authorized || permit.accountId !== message.expectedAccountId) return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: 'Unattended authorization changed during analysis; no write was sent.' };
+    if (!permit.enabled) return { success: true, previewOnly: true, alreadyOrdered: false, applied: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, classifiedCount: analysis.classifiedCount || 0, moveCount: 0, preview: analysis.sortOrder.map(video => ({ title: video.title, subject: video.cluster || video.category || '' })) };
+
+    if (!message.expectedAccountId || playlistAccountIdentity() !== message.expectedAccountId) return { success: false, requiresAttention: true, accountId: playlistAccountIdentity(), pageCount: diagnostics.pageCount, completenessVerified: true, error: 'The YouTube account changed before the reorder. No write was sent.' };
+    const viewSort = await WLViewSort.ensureManual();
+    if (viewSort !== 'manual') return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: 'Could not confirm YouTube Manual playlist view; no reorder was sent.' };
+    const immediate = await WLPlaylist.readSnapshot('WL');
+    const immediateOrder = immediate.videos.map(video => video.setVideoId);
+    if (!immediate.complete || immediateOrder.join(',') !== original.join(',')) return { success: false, requiresAttention: true, accountId, pageCount: immediate.diagnostics?.pageCount || diagnostics.pageCount, completenessVerified: immediate.complete, error: immediate.reason || 'Watch Later changed since inspection; no reorder was sent.' };
+    await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'pending' });
+    try {
+      const finalPermit = await chrome.runtime.sendMessage({ type: 'GET_AUTOMATION_PERMIT' });
+      if (!finalPermit?.enabled || !finalPermit.authorized || finalPermit.accountId !== message.expectedAccountId) {
+        await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'not-applied' });
+        return { success: true, previewOnly: true, alreadyOrdered: false, applied: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, classifiedCount: analysis.classifiedCount || 0, moveCount: 0, preview: analysis.sortOrder.map(video => ({ title: video.title, subject: video.cluster || video.category || '' })) };
+      }
+      if (playlistAccountIdentity() !== message.expectedAccountId) {
+        await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'not-applied' });
+        return { success: false, requiresAttention: true, accountId: playlistAccountIdentity(), pageCount: diagnostics.pageCount, completenessVerified: true, error: 'The YouTube account changed immediately before the reorder. No write was sent.' };
+      }
+      const write = await WLPlaylist.applyOrder('WL', target, { complete: true, originalOrder: original });
+      if (!write.applied) {
+        await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'not-applied' });
+        return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: write.error || 'YouTube did not verify the reordered playlist.' };
+      }
+      await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'verified' });
+      return { success: true, applied: true, alreadyOrdered: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, classifiedCount: analysis.classifiedCount || 0, moveCount: write.moveCount || 0 };
+    } catch (error) {
+      await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'uncertain' }).catch(() => {});
+      return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: `Reorder result is uncertain; inspect Watch Later and the saved recovery backup. ${error.message}` };
+    }
+  } catch (error) {
+    return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: error.message };
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'AUTOMATION_PING') { sendResponse({ ready: true }); return false; }
+  if (message?.type === 'RUN_UNATTENDED_AUTOMATION') { runUnattendedContent(message).then(sendResponse); return true; }
+});
 
 // A 20s polling backstop used to live here. It was diagnostic scaffolding for
 // "the trigger never mounts on page load", whose root cause turned out to be

@@ -161,13 +161,14 @@ const WLInnerTube = {
     const seen = new Set();
 
     for (let page = 1; page < maxPages && token; page++) {
-      if (seen.has(token)) break;
+      if (seen.has(token)) throw new Error('Playlist paging repeated a continuation token; refusing an incomplete read.');
       seen.add(token);
 
       const next = await this.call('browse', { continuation: token });
       pages.push(next);
       token = this.nextToken(next);
     }
+    if (token) throw new Error(`Playlist exceeds the safe ${maxPages}-page retrieval limit; refusing to use a partial playlist.`);
     return pages;
   },
 };

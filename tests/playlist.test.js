@@ -9,12 +9,12 @@ import { loadGlobal } from './helpers/load-global.js';
 // stubbing those globals. call/pageAll are stubbed per-test as before.
 const realInnerTube = loadGlobal('content/innertube.js', 'WLInnerTube', {});
 
-function load(innerTube = {}) {
+function load(innerTube = {}, globals = {}) {
   const stub = {
     findAll: realInnerTube.findAll.bind(realInnerTube),
     ...innerTube,
   };
-  return loadGlobal('content/playlist.js', 'WLPlaylist', { WLInnerTube: stub });
+  return loadGlobal('content/playlist.js', 'WLPlaylist', { WLInnerTube: stub, ...globals });
 }
 
 function renderer(overrides = {}) {
@@ -138,6 +138,82 @@ describe('WLPlaylist.read', () => {
   });
 });
 
+describe('WLPlaylist completeness gate', () => {
+  it('marks a continuation result incomplete when the response has no authoritative item count', async () => {
+    const playlist = load({ pageAll: async () => [{ contents: [{ playlistVideoRenderer: renderer({ setVideoId: 'A' }) }] }] });
+    const snapshot = await playlist.readSnapshot('WL');
+    assert.equal(snapshot.complete, false);
+    assert.match(snapshot.reason, /cannot be verified/);
+  });
+  it('does not trust a generic videoCount nested in an InnerTube response', async () => {
+    const playlist = load({ pageAll: async () => [{ videoCount: 1, unrelatedWidget: { videoCount: 1 }, contents: [{ playlistVideoRenderer: renderer({ setVideoId: 'A' }) }] }] });
+    const snapshot = await playlist.readSnapshot('WL');
+    assert.equal(snapshot.paginationTerminated, true);
+    assert.equal(snapshot.expectedCount, null);
+    assert.equal(snapshot.complete, false);
+  });
+  it('accepts an exact YouTube playlist header count when every entry is distinct and identified', async () => {
+    const header = { playlistHeaderRenderer: { numVideosText: { simpleText: '2 videos' } } };
+    const playlist = load({ pageAll: async () => [{ ...header, contents: [
+      { playlistVideoRenderer: renderer({ videoId: 'a', setVideoId: 'A' }) },
+      { playlistVideoRenderer: renderer({ videoId: 'b', setVideoId: 'B', isPlayable: false, title: { simpleText: 'Private video' } }) },
+    ] }] }, { document: { querySelectorAll: () => [{ innerText: '2 videos' }] } });
+    const snapshot = await playlist.readSnapshot('WL');
+    assert.equal(snapshot.expectedCount, 2);
+    assert.equal(snapshot.uniqueEntryCount, 2);
+    assert.equal(snapshot.integrityValid, true);
+    assert.equal(snapshot.complete, true);
+    assert.equal(snapshot.visibleHeaderCount, 2);
+    assert.equal(snapshot.diagnostics.pageCount, 1);
+    assert.equal(snapshot.diagnostics.outcome, 'verified');
+    assert.equal(snapshot.videos[1].unavailable, true);
+  });
+  it('fails closed when an exact header count disagrees with retrieved distinct entries', async () => {
+    const playlist = load({ pageAll: async () => [{
+      playlistHeaderRenderer: { numVideosText: { runs: [{ text: '46' }, { text: ' videos' }] } },
+      contents: [{ playlistVideoRenderer: renderer({ setVideoId: 'A' }) }],
+    }] }, { document: { querySelectorAll: () => [{ innerText: '46 videos' }] } });
+    const snapshot = await playlist.readSnapshot('WL');
+    assert.equal(snapshot.expectedCount, 46);
+    assert.equal(snapshot.complete, false);
+    assert.match(snapshot.reason, /reports 46.*retrieved/);
+  });
+  it('rejects abbreviated header counts instead of treating them as exact', async () => {
+    const playlist = load({ pageAll: async () => [{
+      playlistHeaderRenderer: { numVideosText: { simpleText: '1.2K videos' } },
+      contents: [{ playlistVideoRenderer: renderer({ setVideoId: 'A' }) }],
+    }] });
+    const snapshot = await playlist.readSnapshot('WL');
+    assert.equal(snapshot.expectedCount, null);
+    assert.equal(snapshot.complete, false);
+  });
+  it('requires the rendered header count to agree with the response header count', async () => {
+    const playlist = load({ pageAll: async () => [{
+      playlistHeaderRenderer: { numVideosText: { simpleText: '19 videos' } },
+      contents: Array.from({ length: 19 }, (_, i) => ({ playlistVideoRenderer: renderer({ videoId: `v${i}`, setVideoId: `S${i}` }) })),
+    }] }, { document: { querySelectorAll: () => [{ innerText: '18 videos' }] } });
+    const snapshot = await playlist.readSnapshot('WL');
+    assert.equal(snapshot.complete, false);
+    assert.match(snapshot.reason, /rendered header reports 18.*response reports 19/);
+    assert.equal(snapshot.diagnostics.completenessVerified, false);
+  });
+  it('fails closed for duplicates and unidentified playlist entries', async () => {
+    const duplicate = renderer({ setVideoId: 'A' });
+    const playlist = load({ pageAll: async () => [{ contents: [{ playlistVideoRenderer: duplicate }, { playlistVideoRenderer: duplicate }, { playlistVideoRenderer: renderer({ setVideoId: undefined }) }] }] });
+    const snapshot = await playlist.readSnapshot('WL');
+    assert.equal(snapshot.complete, false);
+    assert.match(snapshot.reason, /duplicate or unidentified/);
+  });
+  it('refuses permanent mutation unless the caller provides a validated snapshot', async () => {
+    const { playlist, calls } = (() => {
+      const calls = [];
+      return { calls, playlist: load({ call: async (...args) => { calls.push(args); }, pageAll: async () => [] }) };
+    })();
+    await assert.rejects(playlist.applyOrder('WL', ['A', 'B']), /completeness has not been verified/);
+    assert.equal(calls.length, 0);
+  });
+});
+
 describe('WLPlaylist.buildMoveActions', () => {
   it('anchors the first item with MOVE_VIDEO_BEFORE', () => {
     const [first] = load().buildMoveActions(['A', 'B', 'C']);
@@ -156,6 +232,13 @@ describe('WLPlaylist.buildMoveActions', () => {
 
   it('produces one action per item', () => {
     assert.equal(load().buildMoveActions(['A', 'B', 'C', 'D']).length, 4);
+  });
+
+  it('minimizes moves to entries outside the longest stable subsequence', () => {
+    const actions = load().buildMoveActions(['B', 'C', 'D', 'A'], ['A', 'B', 'C', 'D']);
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].setVideoId, 'A');
+    assert.equal(actions[0].movedSetVideoIdPredecessor, 'D');
   });
 
   it('returns no actions for lists too short to reorder', () => {
@@ -179,8 +262,15 @@ describe('WLPlaylist.applyOrder', () => {
         calls.push({ endpoint, body });
         return handlers(endpoint, body, calls.length);
       },
-      pageAll: async () => [handlers('browse', {}, calls.length)],
+      pageAll: async () => {
+        const page = handlers('browse', {}, calls.length);
+        return [{ ...page, videoCount: realInnerTube.findAll(page, 'playlistVideoRenderer').length }];
+      },
     });
+    // This writer-contract fixture simulates a separately validated snapshot;
+    // the real readSnapshot intentionally cannot provide this for Watch Later.
+    const readSnapshot = playlist.readSnapshot.bind(playlist);
+    playlist.readSnapshot = async (...args) => ({ ...(await readSnapshot(...args)), complete: true, reason: null });
     return { playlist, calls };
   }
 
@@ -190,26 +280,22 @@ describe('WLPlaylist.applyOrder', () => {
         ? { status: 'STATUS_SUCCEEDED' }
         : { contents: [{ playlistVideoRenderer: renderer({ videoId: 'a', setVideoId: 'A' }) }] }
     );
-    await playlist.applyOrder('PLx', ['A']);
+    await playlist.applyOrder('PLx', ['A'], { complete: true, originalOrder: ['A'] });
     const edits = calls.filter(c => c.endpoint === 'browse/edit_playlist');
     assert.equal(edits.length, 0);
   });
 
   it('batches all actions into one edit_playlist request', async () => {
-    const { playlist, calls } = withCalls((endpoint) =>
-      endpoint === 'browse/edit_playlist'
-        ? { status: 'STATUS_SUCCEEDED' }
-        : {
-            contents: [
-              { playlistVideoRenderer: renderer({ videoId: 'a', setVideoId: 'A' }) },
-              { playlistVideoRenderer: renderer({ videoId: 'b', setVideoId: 'B' }) },
-            ],
-          }
-    );
-    await playlist.applyOrder('PLx', ['A', 'B']);
+    let edited = false;
+    const { playlist, calls } = withCalls((endpoint) => {
+      if (endpoint === 'browse/edit_playlist') { edited = true; return { status: 'STATUS_SUCCEEDED' }; }
+      const ids = edited ? ['B', 'A'] : ['A', 'B'];
+      return { contents: ids.map((id, i) => ({ playlistVideoRenderer: renderer({ videoId: id.toLowerCase(), setVideoId: id }) })) };
+    });
+    await playlist.applyOrder('PLx', ['B', 'A'], { complete: true, originalOrder: ['A', 'B'] });
     const edits = calls.filter(c => c.endpoint === 'browse/edit_playlist');
     assert.equal(edits.length, 1);
-    assert.equal(edits[0].body.actions.length, 2);
+    assert.equal(edits[0].body.actions.length, 1, 'LIS move plan only moves the displaced entry');
     assert.equal(edits[0].body.playlistId, 'PLx');
   });
 
@@ -224,7 +310,7 @@ describe('WLPlaylist.applyOrder', () => {
             ],
           }
     );
-    const result = await playlist.applyOrder('PLx', ['B', 'A']);
+    const result = await playlist.applyOrder('PLx', ['B', 'A'], { complete: true, originalOrder: ['B', 'A'] });
     assert.equal(result.applied, true);
   });
 
@@ -239,7 +325,7 @@ describe('WLPlaylist.applyOrder', () => {
             ],
           }
     );
-    const result = await playlist.applyOrder('PLx', ['B', 'A'], { timeoutMs: 50, intervalMs: 10 });
+    const result = await playlist.applyOrder('PLx', ['B', 'A'], { timeoutMs: 50, intervalMs: 10, complete: true, originalOrder: ['A', 'B'] });
     assert.equal(result.applied, false);
   });
 
@@ -251,7 +337,7 @@ describe('WLPlaylist.applyOrder', () => {
       }
       // endpoint === 'browse' (used by pageAll/read)
       browseCount++;
-      if (browseCount === 1) {
+      if (browseCount <= 2) {
         // Stale read - old order still visible due to server-side caching
         return {
           contents: [
@@ -268,8 +354,34 @@ describe('WLPlaylist.applyOrder', () => {
         ],
       };
     });
-    const result = await playlist.applyOrder('PLx', ['B', 'A'], { timeoutMs: 500, intervalMs: 10 });
+    const result = await playlist.applyOrder('PLx', ['B', 'A'], { timeoutMs: 500, intervalMs: 10, complete: true, originalOrder: ['A', 'B'] });
     assert.equal(result.applied, true);
     assert.ok(result.waitedMs > 0, 'should have polled and waited for convergence');
+  });
+
+  it('retries a transport error only after readback confirms the original sequence', async () => {
+    let writes = 0;
+    const playlist = load({ call: async () => { writes++; if (writes === 1) throw new Error('connection lost'); return {}; } });
+    playlist.readSnapshot = async () => ({ complete: true, videos: (writes >= 2 ? ['B', 'A'] : ['A', 'B']).map(id => ({ setVideoId: id })) });
+    const result = await playlist.applyOrder('PLx', ['B', 'A'], { complete: true, originalOrder: ['A', 'B'], intervalMs: 1, timeoutMs: 20 });
+    assert.equal(result.applied, true);
+    assert.equal(writes, 2);
+  });
+
+  it('stops without another write when readback shows a partial or concurrent change', async () => {
+    let writes = 0;
+    const playlist = load({ call: async () => { writes++; throw new Error('connection lost'); } });
+    let reads = 0;
+    playlist.readSnapshot = async () => ({ complete: true, videos: (reads++ < 2 ? ['A', 'B'] : ['A', 'C']).map(id => ({ setVideoId: id })) });
+    await assert.rejects(playlist.applyOrder('PLx', ['B', 'A'], { complete: true, originalOrder: ['A', 'B'] }), /uncertain.*changed/i);
+    assert.equal(writes, 1);
+  });
+
+  it('detects a concurrent change between preflight and mutation', async () => {
+    let writes = 0, reads = 0;
+    const playlist = load({ call: async () => { writes++; } });
+    playlist.readSnapshot = async () => ({ complete: true, videos: (reads++ === 0 ? ['A', 'B'] : ['A', 'C']).map(id => ({ setVideoId: id })) });
+    await assert.rejects(playlist.applyOrder('PLx', ['B', 'A'], { complete: true, originalOrder: ['A', 'B'] }), /changed during reorder/);
+    assert.equal(writes, 0);
   });
 });

@@ -88,6 +88,63 @@ describe('ANALYZE', () => {
     assert.equal(calls.length, 0);
   });
 
+  it('classifies with local rules by default without API configuration or network calls', async () => {
+    const calls = stubFetch({});
+    const subjects = [
+      { id: 'physics', source: 'custom', name: 'Physics', priority: 0, rules: { includePhrases: ['quantum entanglement'] } },
+      { id: 'other', source: 'custom', name: 'Other / Uncategorised', priority: 1 },
+    ];
+    const { chrome } = createChromeMock({ sync: { settings: { subjects, taxonomy: subjects.map(s => s.name), fallbackSubjectId: 'other' } } });
+    const response = await sendMessage(chrome, { type: 'ANALYZE', videos: [video({ id: 'v', title: 'Quantum entanglement explained' })], playlistId: 'WL' });
+    assert.equal(response.success, true, response.error);
+    assert.equal(response.method, 'local-rules');
+    assert.equal(response.sortOrder[0].cluster, 'Physics');
+    assert.equal(calls.length, 0);
+  });
+
+  it('uses the selected AI provider only for uncertain hybrid classifications', async () => {
+    const calls = stubFetch({ choices: [{ message: { content: '{"clusters":[{"name":"Physics","videoIds":["unknown"]}]}' } }] });
+    const subjects = [
+      { id: 'physics', source: 'custom', name: 'Physics', priority: 0, rules: { includePhrases: ['quantum entanglement'] } },
+      { id: 'other', source: 'custom', name: 'Other / Uncategorised', priority: 1 },
+    ];
+    const { chrome } = createChromeMock({ sync: { settings: { classificationMethod: 'hybrid', provider: 'ollama', subjects, taxonomy: subjects.map(s => s.name), fallbackSubjectId: 'other' } } });
+    const response = await sendMessage(chrome, { type: 'ANALYZE', videos: [video({ id: 'known', title: 'Quantum entanglement explained' }), video({ id: 'unknown', title: 'A quiet walk' })], playlistId: 'WL' });
+    assert.equal(response.success, true, response.error);
+    assert.equal(calls.length, 1);
+    const prompt = calls[0].body.messages[0].content;
+    assert.ok(prompt.includes('unknown'));
+    assert.ok(!prompt.includes('id: "known"'));
+  });
+
+  it('refuses local AI with a cloud provider without making a request', async () => {
+    const calls = stubFetch({});
+    const { chrome } = createChromeMock({ sync: { settings: { classificationMethod: 'local-ai', provider: 'openai', apiKey: 'configured' } } });
+    const response = await sendMessage(chrome, { type: 'ANALYZE', videos: [video()], playlistId: 'WL' });
+    assert.equal(response.success, false);
+    assert.match(response.error, /requires the Ollama provider/);
+    assert.equal(calls.length, 0);
+  });
+
+  it('keeps an explicitly confirmed video label authoritative after rule changes without an AI request', async () => {
+    const calls = stubFetch({});
+    const subjects = [
+      { id: 'physics', source: 'custom', name: 'Physics', priority: 0, rules: {} },
+      { id: 'other', source: 'custom', name: 'Other / Uncategorised', priority: 1, rules: {} },
+    ];
+    const { chrome, syncStore, localStore } = createChromeMock({ sync: { settings: { subjects, taxonomy: subjects.map(s => s.name), fallbackSubjectId: 'other' } } });
+    const item = video({ id: 'v-confirmed', title: 'Quantum notes' });
+    const first = await sendMessage(chrome, { type: 'ANALYZE', videos: [item], playlistId: 'WL' });
+    assert.equal(first.sortOrder[0].cluster, 'Other / Uncategorised');
+    await sendMessage(chrome, { type: 'CLASSIFICATION_FEEDBACK', videoId: item.id, confirmed: true });
+    syncStore.settings = { ...syncStore.settings, subjects: [{ ...subjects[0], rules: { includePhrases: ['quantum'] } }, subjects[1]] };
+    const second = await sendMessage(chrome, { type: 'ANALYZE', videos: [item], playlistId: 'WL' });
+    assert.equal(second.sortOrder[0].cluster, 'Other / Uncategorised');
+    assert.equal(second.sortOrder[0].classificationSource, 'user-confirmed');
+    assert.equal(calls.length, 0);
+    assert.equal(localStore.learningState.examples[0].confirmed, true);
+  });
+
   it('proceeds without a key for a provider that does not need one', async () => {
     const calls = stubFetch({ choices: [{ message: { content: '{"clusters":[{"name":"Music","videoIds":["a","b"]}]}' } }] });
     const { chrome } = createChromeMock({ sync: { settings: { provider: 'ollama' } } });
@@ -198,8 +255,8 @@ describe('ANALYZE sort options', () => {
 
     assert.equal(response.success, true, response.error);
     assert.deepEqual(response.sortOrder.map(v => v.id), ['a', 'b', 'c']);
-    assert.deepEqual(response.sortOptions, { withinGroup: 'duration-desc', inProgress: 'within', groupOrder: 'taxonomy' });
-    assert.equal(localStore.cachedClusters.sortOptions, undefined, 'options live in sortState only');
+    assert.deepEqual(response.sortOptions, { withinGroup: 'duration-desc', secondaryWithinGroup: 'playlist', inProgress: 'within', groupOrder: 'taxonomy' });
+    assert.deepEqual(localStore.cachedClusters.sortOptions, response.sortOptions, 'cached clusters retain the options used for subsequent overrides');
     assert.deepEqual(localStore.sortState.sortOptions, response.sortOptions);
   });
 
@@ -215,5 +272,89 @@ describe('ANALYZE sort options', () => {
 
     assert.equal(response.sortOrder[0].id, 'a');
     assert.equal(response.sortOrder[0].cluster, null);
+  });
+});
+
+describe('classification overrides', () => {
+  it('persists per-video subject IDs, applies them after analysis, and removes them back to automatic', async () => {
+    const subjects = [
+      { id: 'custom:music', source: 'custom', name: 'Music', priority: 0 },
+      { id: 'custom:physics', source: 'custom', name: 'Physics', priority: 1 },
+    ];
+    const { chrome, localStore } = createChromeMock({ sync: { settings: { provider: 'ollama', subjects, taxonomy: ['Music', 'Physics'] } } });
+    const calls = stubFetch({ choices: [{ message: { content: '{"clusters":[{"name":"Music","videoIds":["v"]}]}' } }] });
+    const first = await sendMessage(chrome, { type: 'ANALYZE', videos: [video()], playlistId: 'WL' });
+    assert.equal(first.sortOrder[0].cluster, 'Music');
+    const changed = await sendMessage(chrome, { type: 'SET_CLASSIFICATION_OVERRIDE', videoId: 'v', subjectId: 'custom:physics', playlistId: 'WL' });
+    assert.equal(changed.sortOrder[0].cluster, 'Physics');
+    assert.equal(localStore.classificationOverrides.v, 'custom:physics');
+    assert.equal(localStore.learningState.examples[0].subjectId, 'custom:physics');
+    assert.equal(localStore.learningState.examples[0].confirmed, true);
+    const rerun = await sendMessage(chrome, { type: 'ANALYZE', videos: [video()], playlistId: 'WL' });
+    assert.equal(rerun.sortOrder[0].cluster, 'Physics');
+    assert.equal(calls.length, 1, 'unchanged metadata reused the classification cache');
+    const reverted = await sendMessage(chrome, { type: 'SET_CLASSIFICATION_OVERRIDE', videoId: 'v', subjectId: '', playlistId: 'WL' });
+    assert.equal(reverted.sortOrder[0].cluster, 'Music');
+    assert.equal('v' in localStore.classificationOverrides, false);
+  });
+
+  it('keeps manual overrides when learned examples are reset', async () => {
+    const { chrome, localStore, syncStore } = createChromeMock({
+      local: {
+        classificationOverrides: { v: 'custom:physics' },
+        learningState: { examples: [{ videoId: 'v', corrected: true, confirmed: true }], sortingPreferences: [{ id: 'sort:History:withinGroup:duration-desc:asc', type: 'sorting', group: 'History', slot: 'withinGroup', field: 'duration-desc', previousValue: 'duration-asc', enabled: true }] },
+      },
+      sync: {
+        settings: {
+          sort: {
+            subjectSorts: { History: { withinGroup: 'duration-desc' } },
+          },
+        },
+      },
+    });
+    const reset = await sendMessage(chrome, { type: 'RESET_LEARNED_PREFERENCES' });
+    assert.equal(reset.success, true);
+    assert.equal(localStore.classificationOverrides.v, 'custom:physics');
+    assert.deepEqual(localStore.learningState.examples, []);
+    assert.deepEqual(syncStore.settings.sort.subjectSorts.History, { withinGroup: 'duration-asc' });
+  });
+});
+
+describe('classification cache bounds and invalidation', () => {
+  it('removes entries from a stale taxonomy configuration', async () => {
+    const staleKey = JSON.stringify(['v', 'T', 'C', null, null, 'old-taxonomy']);
+    const { chrome, localStore } = createChromeMock({
+      local: { classificationCache: { [staleKey]: 'Old category' } },
+      sync: { settings: { provider: 'ollama' } },
+    });
+    stubFetch({ choices: [{ message: { content: '{"clusters":[{"name":"Music","videoIds":["v"]}]}' } }] });
+    const response = await sendMessage(chrome, { type: 'ANALYZE', videos: [video()], playlistId: 'WL' });
+    assert.equal(response.success, true, response.error);
+    assert.equal(staleKey in localStore.classificationCache, false);
+  });
+
+  it('bounds the AI cache without evicting manual overrides', async () => {
+    const cache = Object.fromEntries(Array.from({ length: 2001 }, (_, i) => [`stale-${i}`, 'Old']));
+    const { chrome, localStore } = createChromeMock({
+      local: { classificationCache: cache, classificationOverrides: { retained: 'custom:music' } },
+      sync: { settings: { provider: 'ollama' } },
+    });
+    stubFetch({ choices: [{ message: { content: '{"clusters":[{"name":"Music","videoIds":["v"]}]}' } }] });
+    const response = await sendMessage(chrome, { type: 'ANALYZE', videos: [video()], playlistId: 'WL' });
+    assert.equal(response.success, true, response.error);
+    assert.ok(Object.keys(localStore.classificationCache).length <= 2000);
+    assert.equal(localStore.classificationOverrides.retained, 'custom:music');
+  });
+});
+
+describe('on-open preview mode', () => {
+  it('shows read-only preview before authorization and only enables writes after unattended consent', async () => {
+    const { chrome } = createChromeMock({ sync: { settings: { automation: { mode: 'on-open' }, classificationMethod: 'local-rules' } } });
+    const before = await sendMessage(chrome, { type: 'AUTO_PREVIEW_STATUS' });
+    assert.equal(before.enabled, true);
+    assert.equal(before.onOpenMode, true);
+    assert.equal(before.autoOrganize, false);
+    assert.equal(before.autoPreviewAllowed, true);
+    assert.equal(before.manualDryRunCompleted, false);
   });
 });

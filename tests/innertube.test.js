@@ -280,7 +280,7 @@ describe('WLInnerTube.pageAll', () => {
     assert.deepEqual([...result.map(p => p.id)], [1, 2, 3]);
   });
 
-  it('stops when a continuation token repeats', async () => {
+  it('fails closed when a continuation token repeats', async () => {
     const stuck = { id: 'x', continuationItemRenderer: { continuationCommand: { token: 'same' } } };
     const api = load({
       fetch: async () => ({ ok: true, status: 200, json: async () => stuck }),
@@ -288,7 +288,6 @@ describe('WLInnerTube.pageAll', () => {
     });
     api._config = { apiKey: 'K', clientName: 'WEB', clientVersion: '2.0' };
 
-    const result = await api.pageAll({ browseId: 'VLWL' });
-    assert.equal(result.length, 2, 'should stop once the token repeats');
+    await assert.rejects(api.pageAll({ browseId: 'VLWL' }), /repeated a continuation token/);
   });
 });

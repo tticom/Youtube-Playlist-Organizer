@@ -21,6 +21,12 @@ describe('WLEnrich.extract', () => {
     assert.equal(description, 'A description.');
   });
 
+  it('pulls available topic IDs without requiring them to be present', () => {
+    const { topicIds } = load({ findAll: (value, key) => key === 'topicIds' ? [value.videoDetails?.topicDetails?.topicIds || []] : [] })
+      .extract(playerResponse({ videoDetails: { topicDetails: { topicIds: ['/m/02vxn', '/m/07c1v'] } } }));
+    assert.deepEqual(Array.from(topicIds), ['/m/02vxn', '/m/07c1v']);
+  });
+
   it('truncates long descriptions to MAX_DESCRIPTION', () => {
     const enrich = load();
     const long = 'x'.repeat(1000);
@@ -44,6 +50,7 @@ describe('WLEnrich.enrich', () => {
     ];
     await enrich.enrich(videos, { concurrency: 2 });
     assert.equal(videos[0].category, 'Science & Technology');
+    assert.deepEqual(Array.from(videos[0].topicIds), []);
     assert.equal(videos[1].category, 'Science & Technology');
   });
 

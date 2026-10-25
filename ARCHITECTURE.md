@@ -8,7 +8,7 @@ What the extension is built on, what was measured rather than assumed, and which
 
 | Fact | Detail |
 |---|---|
-| Auth | `SAPISID` cookie IS readable from a content script. Header is `SAPISIDHASH <unix_seconds>_<sha1("<unix_seconds> <SAPISID> <origin>")>`. **No extra permissions needed** |
+| Auth | Existing InnerTube calls authenticate in the YouTube content script using its page session. The extension never copies cookies into storage or diagnostic records. Scheduling uses alarms and YouTube-host-scoped tab operations; notification access is optional |
 | Unauthenticated | 404 on private playlists — the auth header is mandatory |
 | Reorder | `browse/edit_playlist` accepts **every move in one call**: 205ms regardless of playlist size. Sequential was 8 calls / 4355ms |
 | **Unanchored moves are a silent no-op** | An action with no `movedSetVideoIdPredecessor`/`movedSetVideoIdSuccessor` returns `STATUS_SUCCEEDED` and changes nothing. This cost a full debugging cycle |
@@ -30,6 +30,7 @@ History is enabled on the account, so a sparse feed isn't the explanation. **Don
 ## Module map
 
 ```
+
 content/     (globals, NOT ES modules, load-ordered by manifest)
   announce.js    —           — one YT_PAGE message so the background can colour this tab's icon
   selectors.js   SELECTORS   — the ONLY YouTube selectors in the project
@@ -43,29 +44,44 @@ content/     (globals, NOT ES modules, load-ordered by manifest)
   panel.js       WLPanel     — orchestration, SPA lifecycle
 lib/         (ES modules; imported by the background and the popup)
   taxonomy.js    — default category list and group names
+  configuration.js — source-aware subjects, limited topic catalogue, example preset and import/export
   providers.js   — PROVIDERS table, MODEL_GUIDANCE, pickRecommended()
   settings.js    — DEFAULT_SETTINGS, normalizeSettings(), load/save over storage.sync
   sort.js        — buildSortOrder(videos, clusters, overrides, taxonomy, options), SORT_CHOICES, normalizeSortOptions()
   classify.js    — buildPrompt(), parseClusters(), categorizeVideos(), listModels()
+  local-classify.js — weighted local rules, evidence explanations and deterministic fallback
+  learning.js    — locally stored confirmed examples, reviewed rule suggestions and explicit sort feedback
+  automation.js  — validated schedule bounds, safety fingerprint, stale-lock and bounded-history helpers
 background/
-  service-worker.js — message handlers: ANALYZE, RESORT, SORT_BY_DURATION, GET_SORT_STATE, LIST_MODELS, YT_PAGE
+  service-worker.js — classification and learning handlers plus MV3 alarms, persistent run locks, authorization, tab orchestration, status and run history
 popup/
   popup.html popup.js popup.css — settings form (module script) and the Firefox host-permission banner
 ```
 
+`configuration.js` keeps category external IDs (`youtube-category:<id>`), curated topic IDs (`youtube-topic:/m/...`) and custom IDs (`custom:<id>`) distinct. Existing string taxonomies migrate to custom subjects so prior settings remain usable. The topic list follows YouTube's documented small curated set, not the discontinued comprehensive Freebase catalogue.
+
+Permanent writes require an exact playlist-header total, one identified renderer per reported entry (including unavailable videos), terminated pagination, no duplicates, and a fresh matching pre-write sequence. InnerTube paging termination alone is not treated as completeness. The supported Data API explicitly excludes Watch Later, so the extension uses the exact playlist header count when YouTube supplies it and fails closed when the count is absent, abbreviated, mismatched, or the entry set has integrity issues. Generic `videoCount` fields remain ignored because they may describe nested widgets.
+
 ### Message flow
 
 1. `WLPanel.runSort('ai')` reads the playlist through InnerTube, enriches it via `player` calls, and sends `ANALYZE` to the background.
-2. The background loads settings, refuses if the provider needs a key and none is set, builds one prompt from titles/channels/categories plus the user's category list and instructions, and calls the provider: Anthropic's Messages API for `kind: 'anthropic'`, `POST {baseUrl}/chat/completions` for `kind: 'openai'` (OpenAI, Gemini's compatibility endpoint, OpenRouter, Ollama, custom).
+2. New settings use weighted local rules and make no network requests. Local AI requires Ollama. Cloud AI is explicit; Hybrid sends only uncertain local results to the selected provider. AI prompt calls use Anthropic's Messages API for `kind: 'anthropic'` or `POST {baseUrl}/chat/completions` for `kind: 'openai'`.
 3. `buildSortOrder` orders the result — by default in-progress first, then the user's categories in their order, then model-invented names, then Other and Unavailable; `settings.sort` (or the message's `sortOptions`) changes the in-group order, where in-progress videos go, and the group order — and caches the clusters so `RESORT` (toggling "treat as unwatched", or changing a sort option in the preview) never calls the model again.
-4. Apply first switches the playlist's sort chip to **Manual** through the DOM (`WLViewSort`) — with any other view sort selected the write succeeds but every read keeps the view's order, so the poll below never converges — then sends every move in one `browse/edit_playlist` call, polls until the read converges, stores the group map and the undo state (`{ playlistId, previous, current }` as setVideoId lists; `previous` is a fresh read taken right before the write, after the Manual switch), and reloads. A write that never reads back clears the undo state, since the order is then unknown. `WLHeadings` re-injects headings from the stored map on every page load until the playlist's video set changes or the sort chip stops reading the label recorded with the map (the user picked another view sort, which reorders the list under the headings; `checkViewSort` drops them live too); the **Hide/Show headings** chip after Organize sets a `hidden` flag on the map. **Undo last sort** (offered when the undo state belongs to this playlist) re-reads the playlist, refuses unless it still reads exactly as `current` (an added, removed or hand-moved video since), writes `previous` through the same path, and clears both the group map and the undo state.
+4. Classification cache keys include video ID, title, channel, video category, description, method, taxonomy/instructions and approved learned-rule versions. Cache values retain provenance and local evidence. The 2,000-entry LRU-like cache evicts oldest touched entries; per-video manual subject IDs and learning examples are stored separately and never evicted with derived results. Preview sort changes and overrides reuse cached classifications.
+5. Subject override selectors in the preview persist by video ID. Choosing Automatic restores the cached AI assignment (or explicit fallback), then immediately recomputes the order without another model call.
+6. Automation has Manual, on-open, and scheduled modes. On-open previews until separately authorized. Scheduled runs use `chrome.alarms` in the MV3 service worker, reuse an already open Watch Later tab or create an inactive temporary one, and ask the content script to perform DOM-dependent InnerTube reads and validated sorting. The service worker closes only a temporary tab it created. Host access is already limited to YouTube; the extension does not request the broad `tabs` permission. Notifications use optional permission.
+7. Unattended writes require a verified manual reorder with a real move, then a separate explicit consent action. Authorization stores the YouTube channel path, Watch Later ID, and subject/sort safety fingerprint in local extension storage. Account or safety-configuration mismatch stops writes until renewed manual acceptance. Approved learned rules apply automatically; pending suggestions never do.
+8. Every automation run checks the account, complete exact-count snapshot, entry identity and calculated permutation. Unchanged order skips the write. Before mutation, a complete preflight read must still match and the original order is backed up. `applyOrder` performs its own fresh completeness and sequence check, applies a minimal LIS-based move plan, reads back the exact order, and retains recovery data on uncertainty. No mutation retry happens after an ambiguous result.
+9. The lock and run summaries are persisted locally; summaries are bounded and omit cookies, tokens, video IDs and titles. Stale locks are recovered conservatively and marked for inspection. Transient errors back off exponentially up to five attempts; integrity/account/ambiguous-write failures pause automation. Failure notifications can be enabled optionally; status and history remain in the popup.
+10. Scheduled work requires Chrome to be running. `chrome.alarms` can be delayed while the computer sleeps or Chrome is resource-constrained. The worker is event-driven; startup recreates missing alarms and catches up one overdue cycle. Inactive YouTube tab rendering and full unattended behavior still require live acceptance; mocked tests do not establish that behavior.
+11. Corrections and confirmations stay in `chrome.storage.local`; they are excluded from provider prompts. Suggestions require repeated confirmed corrections, configurable evidence and consistency thresholds, and explicit approval. Channel-wide suggestions are not generated. Explicit changes to within-group sorting can suggest a global preference; existing playlist order is never used as evidence. Sorting suggestions do not modify the personal preset.
 
 ### Hard constraints
 
 Violating these breaks the extension at runtime, not at test time:
 
 1. **`content/` files are NOT ES modules.** One global each (`const WLThing = {...}`), load-ordered by the manifest. Adding `import`/`export` breaks them in the browser while tests still pass.
-2. **`lib/` files ARE ES modules.** Firefox's background is built by **concatenating** them and `sed`-ing out module syntax. `build.sh` strips `export function`, `export async function`, `export const`, and `import`. **Any other export form silently produces a broken Firefox background script.** This already happened once — `export const` wasn't stripped when `lib/taxonomy.js` was added. A new `lib/` file must also be added to the `LIB` list in `build.sh`, in dependency order; `node --check` on the bundle catches syntax but not a missing file.
+2. **`lib/` files ARE ES modules.** Firefox's background is built by **concatenating** them and stripping module syntax. `npm run build` uses the cross-platform `build.mjs`; `build.sh` remains the Unix equivalent. Both must include every new `lib/` file in dependency order and strip `export function`, `export async function`, `export const`, and `import`. **Any other export form can break Firefox's background script.** `node --check` on the bundle catches syntax but not missing runtime references.
 3. **No DOM fallback.** InnerTube failures surface as errors. Deliberate: one path to maintain.
 4. **Only our own UI avoids YouTube selectors.** The trigger and modal are elements we create. Heading injection must attach to YouTube's list, and the Manual-sort switch must click YouTube's sort chip — both dependencies are confined to `content/selectors.js`. No InnerTube endpoint for the view-sort preference has been identified; if one is, `WLViewSort` is the only thing to replace.
 5. **Nothing may become a child of `DIV#contents` except playlist items.** YouTube's `handleDragMove_` indexes a rect cache by child position, so one foreign sibling breaks drag-to-reorder for the whole list. Headings therefore mount *inside* their anchor item (see "Headings and drag-to-reorder" below).
@@ -79,7 +95,8 @@ Violating these breaks the extension at runtime, not at test time:
 | Enrich via `player` | Category and description come in the same response; "category only" costs the same for less |
 | `percentWatched < 10` = unwatched | YouTube marks a video partially watched after ~2 seconds. 11 of 31 real videos were being promoted to the top |
 | Overrides are **global**, not per-playlist | An override asserts "YouTube's watch data for this video is wrong" — a property of the video, not the list |
-| Fixed taxonomy + a small number of new categories | Stable headings week to week without forcing odd content into `Other`. The list and the limit are user settings; the defaults live in `lib/taxonomy.js` |
+| Configurable subject list with a user-defined fallback | Users can mix YouTube video categories, the partial curated Topics list, and custom subjects while preserving stable source-aware IDs |
+| Classification overrides are separate from AI cache | Manual choices persist by video ID and are never evicted with cached model output |
 | One settings key in `storage.sync` | The popup and background share `lib/settings.js`; a legacy top-level `apiKey` is migrated on first read |
 | Non-streaming provider calls | The whole response is parsed as JSON at the end, so streaming bought nothing but code |
 | No `tabs` permission | The per-tab icon is set when the content script sends `YT_PAGE`; watching every navigation was the only thing `tabs` did |
@@ -97,14 +114,14 @@ Each heading is now the **first child of the item that starts its group**, so as
 
 ## Testing notes
 
-- `npm test` → `node --test tests/*.test.js`. **The glob is required** — bare `node --test tests/` fails. No test framework, zero test dependencies, deliberately.
+- `npm test` → `node --test tests/*.test.js`. In restricted Windows sandboxes the runner can fail before test execution with worker `spawn EPERM`; run each file directly with `node tests/<name>.test.js` to distinguish that environment limitation from application failures.
 - **Content-script globals** are evaluated in a `node:vm` sandbox by `tests/helpers/load-global.js`. That helper is shared by every test; keep it small.
 - **vm-realm gotcha:** arrays and objects created inside the sandbox carry the sandbox's constructors, so `assert.deepEqual` rejects them against outer-realm literals. **Normalise at the assertion** by spreading: `assert.deepEqual([...result], [...])` or `{ ...obj }`. This will bite you; it is not the implementation's fault.
 - **Background handlers** are not exported (the file is concatenated for Firefox). `tests/resort-handler.test.js` and `tests/analyze-handler.test.js` capture the `onMessage` listener through a mocked `chrome` global and stub `globalThis.fetch`.
 
 ## Known rough edges
 
-- `pageAll` caps at 20 pages and returns a truncated result indistinguishable from a complete one (~2,000-video ceiling).
+- Upstream `pageAll` stopped silently on a repeated continuation and returned whatever pages it had accumulated; it had no page cap or completeness status. This fork now rejects a repeated continuation and a continuation remaining after 20 pages. It also compares distinct identified entries against the exact playlist-header total; the read still fails closed if YouTube omits or abbreviates that count. A reported older WEB client regression stopped supplying continuation tokens after 200 videos, which is why termination alone never passes the completeness gate.
 - Each `applyOrder` poll re-pages the whole playlist — up to ~12 re-reads in the 10s window on a multi-page playlist.
 - A storage write queued behind a failing one inherits that rejection rather than retrying.
 

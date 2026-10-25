@@ -410,3 +410,16 @@ html[dark] .wl-modal-backdrop {
   font-size: 1.2rem;
   line-height: 1.8rem;
 }
+
+.wl-retrieval-diagnostics {
+  margin: 8px 20px;
+  padding: 8px 10px;
+  border: 1px solid var(--wl-outline);
+  border-radius: 8px;
+  color: var(--wl-text-2);
+  font-size: 1.2rem;
+}
+.wl-retrieval-diagnostics summary { cursor: pointer; color: var(--wl-text); }
+.wl-retrieval-diagnostics dl { display: grid; grid-template-columns: minmax(150px, 1fr) 2fr; gap: 3px 12px; margin: 8px 0 0; }
+.wl-retrieval-diagnostics dt { font-weight: 600; }
+.wl-retrieval-diagnostics dd { margin: 0; overflow-wrap: anywhere; }

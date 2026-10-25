@@ -247,7 +247,7 @@ const selectorFor = (root) => (selector) => {
 /**
  * Renders a preview and hands back the sort-option controls by their role:
  * `rows` are the disclosure buttons (data-wl-sort), `lists` the radio groups
- * they unfold, `radios[key]` the inputs (data-wl-sort-choice), `sw` the switch.
+ * they unfold, `radios[key]` the inputs (data-wl-sort-choice).
  */
 function previewWith({ sortOrder = [], sortOptions = null, handlers = {}, activeSortKey = null, activeChoiceKey = null } = {}) {
   const { make, document } = fakeUi();
@@ -271,14 +271,14 @@ function previewWith({ sortOrder = [], sortOptions = null, handlers = {}, active
   for (const el of all.filter(el => el.type === 'radio')) {
     (radios[el.getAttribute('data-wl-sort-choice')] ??= []).push(el);
   }
-  const sw = all.find(el => el.type === 'checkbox') ?? null;
+  const sw = null;
   const rowFor = (key) => rows.find(r => r.getAttribute('data-wl-sort') === key);
   const listFor = (key) => lists.find(l => l.getAttribute('aria-label') === modal.SORT_FIELD_LABELS[key]);
   return { modal, body, footer, panel, rows, lists, radios, sw, rowFor, listFor, toggle: body.children[0] };
 }
 
 describe('WLModal.showPreview sort options', () => {
-  const options = { withinGroup: 'title', inProgress: 'within', groupOrder: 'alpha' };
+  const options = { withinGroup: 'title', secondaryWithinGroup: 'playlist', inProgress: 'within', groupOrder: 'alpha' };
   const labelOf = (row) => row.children.find(c => c.className === 'wl-row-label').textContent;
   const valueOf = (row) => row.children.find(c => c.className === 'wl-row-value')?.textContent ?? null;
 
@@ -323,26 +323,21 @@ describe('WLModal.showPreview sort options', () => {
     assert.equal(toggle.getAttribute('aria-expanded'), 'true');
   });
 
-  it('renders one row per option: two disclosure rows with their current choice, then the switch', () => {
+  it('renders one choice row per sort option', () => {
     const { panel, rows, radios, sw, rowFor } = previewWith({ sortOptions: options });
     assert.deepEqual(panel.children.map(el => el.className), [
-      'wl-row', 'wl-option-list', 'wl-row', 'wl-option-list', 'wl-row wl-switch-row',
+      'wl-row', 'wl-option-list', 'wl-row', 'wl-option-list', 'wl-row', 'wl-option-list', 'wl-row', 'wl-option-list',
     ]);
-    assert.deepEqual(rows.map(r => r.getAttribute('data-wl-sort')), ['withinGroup', 'groupOrder']);
-    assert.deepEqual(rows.map(labelOf), ['Within a group', 'Group order']);
-    assert.deepEqual(rows.map(valueOf), ['Title A–Z', 'Alphabetical']);
-    assert.deepEqual(rows.map(r => r.getAttribute('aria-expanded')), ['false', 'false']);
-    for (const key of ['withinGroup', 'groupOrder']) {
+    assert.deepEqual(rows.map(r => r.getAttribute('data-wl-sort')), ['withinGroup', 'secondaryWithinGroup', 'inProgress', 'groupOrder']);
+    assert.deepEqual(rows.map(labelOf), ['Within a group', 'Then sort by', 'Group in progress', 'Group order']);
+    assert.deepEqual(rows.map(valueOf), ['Title A–Z', 'Original playlist position', 'Inside their category', 'Alphabetical']);
+    assert.deepEqual(rows.map(r => r.getAttribute('aria-expanded')), ['false', 'false', 'false', 'false']);
+    for (const key of ['withinGroup', 'secondaryWithinGroup', 'inProgress', 'groupOrder']) {
       assert.deepEqual(radios[key].map(r => r.value), SORT_CHOICES[key].map(c => c.value));
       assert.deepEqual(radios[key].map(r => r.name), radios[key].map(() => `wl-${key}`), 'one radio group per option');
       assert.deepEqual(radios[key].filter(r => r.checked).map(r => r.value), [options[key]]);
       assert.ok(rowFor(key).children.some(c => c.className === 'wl-chevron'));
     }
-    assert.equal(sw.type, 'checkbox');
-    assert.equal(sw.getAttribute('role'), 'switch');
-    assert.equal(sw.getAttribute('data-wl-sort'), 'inProgress');
-    assert.equal(sw.checked, false, "'within' renders off");
-    assert.equal(labelOf(panel.children[4]), 'Group in progress');
   });
 
   it('each choice row holds the radio, a check-icon slot and its label', () => {
@@ -355,24 +350,24 @@ describe('WLModal.showPreview sort options', () => {
     assert.equal(option.children[2].textContent, 'My category order');
   });
 
-  it('renders the switch on for inProgress top', () => {
-    const { sw } = previewWith({ sortOptions: { ...options, inProgress: 'top' } });
-    assert.equal(sw.checked, true);
+  it('renders the selected in-progress choice', () => {
+    const { radios } = previewWith({ sortOptions: { ...options, inProgress: 'top' } });
+    assert.deepEqual(radios.inProgress.filter(r => r.checked).map(r => r.value), ['top']);
   });
 
-  it('flipping the switch emits top when on and within when off', () => {
+  it('changing the in-progress choice emits the selected rule', () => {
     const emitted = [];
-    const { sw } = previewWith({
+    const { radios } = previewWith({
       sortOptions: options,
       handlers: { onSortOptionsChange: (next) => emitted.push(next) },
     });
-    sw.checked = true;
-    sw._listeners.change();
-    sw.checked = false;
-    sw._listeners.change();
+    for (const value of ['top', 'sort']) {
+      for (const radio of radios.inProgress) radio.checked = radio.value === value;
+      radios.inProgress.find(r => r.value === value)._listeners.change();
+    }
     assert.deepEqual(emitted.map(o => ({ ...o })), [
-      { withinGroup: 'title', inProgress: 'top', groupOrder: 'alpha' },
-      { withinGroup: 'title', inProgress: 'within', groupOrder: 'alpha' },
+      { withinGroup: 'title', secondaryWithinGroup: 'playlist', inProgress: 'top', groupOrder: 'alpha' },
+      { withinGroup: 'title', secondaryWithinGroup: 'playlist', inProgress: 'sort', groupOrder: 'alpha' },
     ]);
   });
 
@@ -406,8 +401,8 @@ describe('WLModal.showPreview sort options', () => {
     modal.showPreview([], options);
     const panel = body.children[1];
     assert.equal(panel.hidden, false);
-    assert.equal(panel.children[2].getAttribute('aria-expanded'), 'true');
-    assert.equal(panel.children[3].hidden, false);
+    assert.equal(panel.children[6].getAttribute('aria-expanded'), 'true');
+    assert.equal(panel.children[7].hidden, false);
     assert.equal(panel.children[1].hidden, true);
   });
 
@@ -421,7 +416,7 @@ describe('WLModal.showPreview sort options', () => {
     const size = radios.groupOrder.find(r => r.value === 'size');
     for (const r of radios.groupOrder) r.checked = r === size;
     size._listeners.change();
-    assert.deepEqual(emitted.map(o => ({ ...o })), [{ withinGroup: 'title', inProgress: 'within', groupOrder: 'size' }]);
+    assert.deepEqual(emitted.map(o => ({ ...o })), [{ withinGroup: 'title', secondaryWithinGroup: 'playlist', inProgress: 'within', groupOrder: 'size' }]);
     assert.equal(modal._openSortKey, null);
     assert.equal(listFor('groupOrder').hidden, true);
     assert.equal(rowFor('groupOrder').getAttribute('aria-expanded'), 'false');
@@ -444,13 +439,12 @@ describe('WLModal.showPreview sort options', () => {
     };
     pick('withinGroup', 'duration-desc');
     pick('groupOrder', 'alpha');
-    assert.deepEqual({ ...emitted[1] }, { withinGroup: 'duration-desc', inProgress: 'within', groupOrder: 'alpha' });
+    assert.deepEqual({ ...emitted[1] }, { withinGroup: 'duration-desc', secondaryWithinGroup: 'playlist', inProgress: 'within', groupOrder: 'alpha' });
   });
 
   it('does not throw on change when no handler is registered', () => {
     const { radios, sw } = previewWith({ sortOptions: options });
     assert.doesNotThrow(() => radios.withinGroup[0]._listeners.change());
-    assert.doesNotThrow(() => sw._listeners.change());
   });
 
   it('focuses Apply normally, but the control that triggered a re-render keeps focus', () => {
@@ -478,9 +472,9 @@ describe('WLModal.showPreview sort options', () => {
     assert.equal(row.byKey('groupOrder').tagName, 'button');
     assert.deepEqual(row.focused, [row.byKey('groupOrder')]);
 
-    const sw = focusedWith('inProgress');
-    assert.equal(sw.byKey('inProgress').type, 'checkbox');
-    assert.deepEqual(sw.focused, [sw.byKey('inProgress')]);
+    const progress = focusedWith('inProgress');
+    assert.equal(progress.byKey('inProgress').tagName, 'button');
+    assert.deepEqual(progress.focused, [progress.byKey('inProgress')]);
 
     const toggle = focusedWith('toggle');
     assert.deepEqual(toggle.focused, [toggle.byKey('toggle')]);
@@ -549,6 +543,38 @@ describe('WLModal._renderItem unwatched toggle', () => {
     modal._handlers = { onToggleUnwatched: (id) => calls.push(id) };
     modal._renderItem(video({ id: 'v9', percentWatched: 50, inProgress: true })).children[1]._listeners.click();
     assert.deepEqual(calls, ['v9']);
+  });
+});
+
+describe('WLModal classification override selector', () => {
+  it('shows the automatic assignment, selected subjects, and emits a video-ID override', () => {
+    const { document } = fakeUi();
+    const modal = loadGlobal('content/modal.js', 'WLModal', { document });
+    const chosen = [];
+    modal._subjects = [{ id: 'custom:music', name: 'Music' }, { id: 'custom:physics', name: 'Physics' }];
+    modal._handlers = { onClassificationOverride: (videoId, subjectId) => chosen.push([videoId, subjectId]) };
+    const row = modal._renderItem(video({ id: 'video-123', cluster: 'Music', manualOverride: false }));
+    const select = row.children[1];
+    assert.equal(select.className, 'wl-classification-override');
+    assert.equal(select.children[0].textContent, 'Automatic · Music');
+    assert.equal(select.children[0].selected, true);
+    select.value = 'custom:physics';
+    select._listeners.change();
+    assert.deepEqual(chosen, [['video-123', 'custom:physics']]);
+  });
+
+  it('shows actual decision evidence and emits explicit confirmation and uncertainty feedback', () => {
+    const { document } = fakeUi();
+    const modal = loadGlobal('content/modal.js', 'WLModal', { document });
+    const feedback = [];
+    modal._subjects = [{ id: 'custom:physics', name: 'Physics' }];
+    modal._handlers = { onClassificationFeedback: (videoId, value) => feedback.push([videoId, value]) };
+    const row = modal._renderItem(video({ id: 'video-feedback', cluster: 'Physics', classificationEvidence: [{ field: 'title', phrase: 'quantum' }] }));
+    const all = walk(row);
+    assert.ok(all.some(node => String(node.textContent).includes('title “quantum”')));
+    all.find(node => node.textContent === 'Confirm')._listeners.click();
+    all.find(node => node.textContent === 'Uncertain')._listeners.click();
+    assert.deepEqual(JSON.parse(JSON.stringify(feedback)), [['video-feedback', { confirmed: true }], ['video-feedback', { uncertain: true }]]);
   });
 });
 

@@ -44,6 +44,10 @@ LIB=(
   lib/taxonomy.js
   lib/providers.js
   lib/sort.js
+  lib/configuration.js
+  lib/local-classify.js
+  lib/learning.js
+  lib/automation.js
   lib/settings.js
   lib/classify.js
 )

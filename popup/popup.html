@@ -19,6 +19,12 @@
 
   <form class="wl-form" id="settings-form" autocomplete="off">
     <section class="wl-section">
+      <h2 class="wl-section-title">Classification method</h2>
+      <label class="wl-row" for="classification-method"><span class="wl-row-label">Run classifications with</span><select id="classification-method" class="wl-row-select"><option value="local-rules">Local rules (no network)</option><option value="local-ai">Local AI (Ollama)</option><option value="cloud-ai">Cloud AI (explicit opt-in)</option><option value="hybrid">Local rules, then selected AI provider when uncertain</option></select></label>
+      <p class="wl-help">Local rules are the default. Cloud requests happen only in Cloud AI or Hybrid mode. Local AI requires Ollama; it never silently uses a paid provider.</p>
+    </section>
+
+    <section class="wl-section">
       <label class="wl-row" for="provider">
         <span class="wl-row-label">Provider</span>
         <select id="provider" class="wl-row-select"></select>
@@ -50,12 +56,32 @@
     </section>
 
     <section class="wl-section">
+      <h2 class="wl-section-title">Subjects and presets</h2>
+      <div class="wl-field">
+        <label for="preset-select">Saved preset</label>
+        <div class="wl-inline"><select id="preset-select" class="wl-row-select"></select><button class="wl-btn" type="button" id="load-preset">Load</button></div>
+        <div class="wl-inline"><input id="preset-name" placeholder="Preset name"><button class="wl-btn" type="button" id="save-preset">Save current as preset</button><button class="wl-btn" type="button" id="remove-preset">Remove selected</button></div>
+      </div>
+      <div class="wl-field">
+        <label for="subject-search">Find YouTube categories and curated topics</label>
+        <input id="subject-search" type="search" placeholder="Search categories and topics">
+        <div class="wl-inline"><input id="youtube-api-key" type="password" placeholder="Optional YouTube Data API key"><button class="wl-btn" type="button" id="refresh-categories">Refresh categories</button></div>
+        <p class="wl-help">Categories are broad assignable labels. Curated topics are a small legacy Freebase-derived list and are not comprehensive.</p>
+        <div id="subject-catalog" class="wl-subject-list"></div>
+      </div>
+      <div class="wl-field">
+        <label for="custom-subject">Add custom subject</label>
+        <div class="wl-inline"><input id="custom-subject" placeholder="Subject name"><button class="wl-btn" type="button" id="add-subject">Add</button></div>
+      </div>
+      <div class="wl-field"><label>Selected subjects (priority order)</label><ol id="selected-subjects" class="wl-subject-list"></ol></div>
+      <label class="wl-row" for="fallback-subject"><span class="wl-row-label">Fallback when uncertain</span><select id="fallback-subject" class="wl-row-select"></select></label>
+      <div class="wl-inline"><button class="wl-btn" type="button" id="export-settings">Export settings</button><label class="wl-btn" for="import-settings">Import settings</label><input id="import-settings" type="file" accept="application/json" hidden></div>
       <div class="wl-field">
         <div class="wl-field-head">
           <label for="taxonomy">Categories</label>
           <button type="button" class="wl-link" id="reset-taxonomy-btn">Reset to defaults</button>
         </div>
-        <textarea id="taxonomy" rows="8" spellcheck="false"></textarea>
+        <textarea id="taxonomy" rows="8" spellcheck="false" hidden></textarea>
         <p class="wl-help">One per line. Top to bottom is the order groups appear in.</p>
       </div>
 
@@ -71,15 +97,42 @@
       </div>
     </section>
 
+    <section class="wl-section" id="learned-preferences">
+      <h2 class="wl-section-title">Learned Preferences</h2>
+      <p class="wl-help" id="learning-stats">Loading local preference history…</p>
+      <label class="wl-row" for="learning-min-evidence"><span class="wl-row-label">Corrections before suggesting a rule</span><input type="number" id="learning-min-evidence" class="wl-row-number" min="3" max="20" step="1"></label>
+      <label class="wl-row" for="learning-min-consistency"><span class="wl-row-label">Minimum matching examples</span><input type="number" id="learning-min-consistency" class="wl-row-number" min="0.6" max="1" step="0.05"></label>
+      <div id="learning-suggestions" class="wl-subject-list"></div>
+      <div class="wl-inline"><button class="wl-btn" type="button" id="export-learning">Export learned preferences</button><label class="wl-btn" for="import-learning">Import learned preferences</label><input id="import-learning" type="file" accept="application/json" hidden><button class="wl-btn" type="button" id="reset-learning">Reset learned preferences</button></div>
+      <p class="wl-help">Corrections and learning history stay in local extension storage. Reset removes examples and learned rules, while explicit video overrides remain intact.</p>
+    </section>
+
     <section class="wl-section">
       <h2 class="wl-section-title">Sort defaults</h2>
+      <div class="wl-field">
+        <h3>Automation Status</h3>
+        <p class="wl-help">Manual runs require a preview. On-open mode previews unless unattended sorting is authorized. Scheduled mode runs while Chrome is open; computer sleep pauses execution.</p>
+        <label class="wl-row" for="automation-mode"><span class="wl-row-label">Operating mode</span><select id="automation-mode" class="wl-row-select"><option value="manual">Manual</option><option value="on-open">Automatic on opening Watch Later</option><option value="scheduled">Scheduled unattended</option></select></label>
+        <label class="wl-row" for="automation-interval"><span class="wl-row-label">Schedule interval</span><select id="automation-interval" class="wl-row-select"><option value="60">Hourly</option><option value="360">Every 6 hours (default)</option><option value="1440">Daily</option><option value="custom">Custom interval</option></select></label>
+        <label class="wl-row" id="automation-custom-row" for="automation-custom-minutes" hidden><span class="wl-row-label">Custom interval (60–10080 minutes)</span><input type="number" id="automation-custom-minutes" class="wl-row-number" min="60" max="10080" step="1"></label>
+        <label class="wl-row" for="automation-notifications"><span class="wl-row-label">Show run notifications</span><input type="checkbox" id="automation-notifications"></label>
+        <p class="wl-help" id="automation-status" role="status">Loading automation status…</p>
+        <div class="wl-inline"><button class="wl-btn" type="button" id="automation-enable">Enable unattended sorting</button><button class="wl-btn" type="button" id="automation-run-now">Run now</button><button class="wl-btn" type="button" id="automation-preview">Preview only</button></div>
+        <div class="wl-inline"><button class="wl-btn" type="button" id="automation-pause">Pause automation</button><button class="wl-btn" type="button" id="automation-resume">Resume automation</button><button class="wl-btn" type="button" id="automation-disable">Disable unattended sorting</button><button class="wl-btn" type="button" id="automation-history-toggle">View recent results</button></div>
+        <div id="automation-preview-result" class="wl-subject-list" hidden></div>
+        <div id="automation-history" class="wl-subject-list" hidden></div>
+      </div>
       <label class="wl-row" for="sort-within-group">
         <span class="wl-row-label">Within a group</span>
         <select id="sort-within-group" class="wl-row-select"></select>
       </label>
+        <label class="wl-row" for="sort-secondary-within-group">
+          <span class="wl-row-label">Then sort by</span>
+          <select id="sort-secondary-within-group" class="wl-row-select"></select>
+        </label>
       <label class="wl-row" for="sort-in-progress">
         <span class="wl-row-label">Group in progress</span>
-        <input type="checkbox" id="sort-in-progress" class="wl-switch" role="switch">
+        <select id="sort-in-progress" class="wl-row-select"></select>
       </label>
       <label class="wl-row" for="sort-group-order">
         <span class="wl-row-label">Group order</span>
