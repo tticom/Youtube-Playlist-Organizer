@@ -106,6 +106,48 @@ describe('unattended service-worker orchestration with mocked YouTube', () => {
     assert.equal(mock.localStore.automationLock, null);
   });
 
+  it('does not report a structurally unsuccessful success result as a successful run', async () => {
+    const configured = settings('scheduled');
+    const mock = await setup({ settings: configured, local: authorizedLocal(configured), contentResult: { success: true, alreadyOrdered: false, applied: false, previewOnly: false, completenessVerified: true, moveCount: 0, error: 'No verified outcome.' } });
+    const result = await send(mock, { type: 'RUN_AUTOMATION_NOW' });
+    assert.equal(result.success, false);
+    assert.equal(result.status, 'attention');
+    assert.equal(mock.localStore.automationHistory[0].status, 'attention');
+    assert.equal(mock.localStore.automationFailureStreak, 1);
+    assert.equal(mock.localStore.automationPaused, true);
+  });
+
+  it('retries an applyOrder exhaustion only when complete read-back confirms the original order', async () => {
+    const configured = settings('scheduled');
+    const applyResult = { applied: false, retrySafe: true, originalOrderUnchanged: true, completenessVerified: true, moveCount: 1, error: 'YouTube did not confirm the new order. The playlist still matches its original order; no further write was attempted.' };
+    const mock = await setup({ settings: configured, local: authorizedLocal(configured), contentResult: { success: false, ...applyResult } });
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      mock.listeners().alarmListener({ name: AUTOMATION_ALARM });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(mock.localStore.automationHistory.at(-1).status, 'failed');
+      assert.equal(mock.localStore.automationFailureStreak, attempt);
+      if (attempt < 5) {
+        assert.equal(mock.alarms.get(AUTOMATION_ALARM).delayInMinutes, 2 ** attempt);
+        assert.notEqual(mock.localStore.automationPaused, true);
+      }
+    }
+    assert.equal(mock.localStore.automationPaused, true);
+    assert.equal(mock.localStore.automationState.status, 'attention');
+    assert.equal(mock.alarms.has(AUTOMATION_ALARM), false);
+  });
+
+  it('does not retry an ambiguous or incomplete failed write result', async () => {
+    const configured = settings('scheduled');
+    const mock = await setup({ settings: configured, local: authorizedLocal(configured), contentResult: { success: false, applied: false, retrySafe: false, requiresAttention: true, completenessVerified: false, error: 'Write result is ambiguous; playlist read-back was incomplete.' } });
+    const result = await send(mock, { type: 'RUN_AUTOMATION_NOW' });
+    assert.equal(result.success, false);
+    assert.equal(result.status, 'attention');
+    assert.equal(mock.localStore.automationFailureStreak, 1);
+    assert.equal(mock.alarms.has(AUTOMATION_ALARM), false);
+    assert.equal(mock.localStore.automationPaused, true);
+  });
+
   it('previews without enabling writes and returns the intended order to the user', async () => {
     const mock = await setup({ settings: settings('manual'), local: {}, contentResult: { success: true, previewOnly: true, completenessVerified: true, pageCount: 1, preview: [{ title: 'Video', subject: 'Music' }] } });
     const result = await send(mock, { type: 'RUN_AUTOMATION_NOW', previewOnly: true });
@@ -135,7 +177,7 @@ describe('unattended service-worker orchestration with mocked YouTube', () => {
 
   it('backs off transient failures and stops after five attempts', async () => {
     const configured = settings('scheduled');
-    const mock = await setup({ settings: configured, local: authorizedLocal(configured), contentResult: { success: false, error: 'Temporary network failure.' } });
+    const mock = await setup({ settings: configured, local: authorizedLocal(configured), contentResult: { success: false, retrySafe: true, error: 'Temporary network failure.' } });
     for (let i = 0; i < 5; i++) {
       mock.listeners().alarmListener({ name: AUTOMATION_ALARM });
       await new Promise(resolve => setTimeout(resolve, 20));
@@ -203,22 +245,62 @@ describe('unattended service-worker orchestration with mocked YouTube', () => {
     assert.equal(mock.alarms.get(AUTOMATION_ALARM).periodInMinutes, 360);
   });
 
-  it('records manual acceptance only from a verified Watch Later tab reorder', async () => {
+  it('records a verified no-op read without claiming a write or enabling unattended mutation', async () => {
     const configured = settings('scheduled');
     const mock = await setup({ settings: configured, local: {} });
-    const response = await send(mock, { type: 'RECORD_MANUAL_ACCEPTANCE', playlistId: 'WL', accountId: '/@example', moveCount: 1, completenessVerified: true, readbackVerified: true }, { tab: { url: 'https://www.youtube.com/playlist?list=WL' } });
+    const response = await send(mock, { type: 'RECORD_MANUAL_ACCEPTANCE', playlistId: 'WL', accountId: '/@example', evidenceKind: 'read-noop', moveCount: 0, completenessVerified: true, verifiedRead: true, orderMatched: true, verifiedWrite: false, readbackVerified: false }, { tab: { url: 'https://www.youtube.com/playlist?list=WL' } });
+    assert.equal(response.success, true);
+    assert.equal(mock.localStore.lastManualAcceptance.manualReadVerified, true);
+    assert.equal(mock.localStore.lastManualAcceptance.evidenceKind, 'read-noop');
+    assert.equal(mock.localStore.lastManualAcceptance.manualMutationVerified, false);
+    const status = await send(mock, { type: 'GET_AUTOMATION_STATUS' });
+    assert.equal(status.manualReadVerified, true);
+    assert.equal(status.manualWriteVerified, false);
+    assert.equal(status.acceptanceReady, false);
+    assert.equal((await send(mock, { type: 'ENABLE_UNATTENDED_SORTING', confirmed: true })).success, false);
+  });
+
+  it('records a separately verified live write as mutation evidence', async () => {
+    const configured = settings('scheduled');
+    const mock = await setup({ settings: configured, local: {} });
+    const response = await send(mock, { type: 'RECORD_MANUAL_ACCEPTANCE', playlistId: 'WL', accountId: '/@example', evidenceKind: 'write', moveCount: 1, completenessVerified: true, verifiedRead: true, orderMatched: true, verifiedWrite: true, readbackVerified: true }, { tab: { url: 'https://www.youtube.com/playlist?list=WL' } });
     assert.equal(response.success, true);
     assert.equal(mock.localStore.lastManualAcceptance.manualReorderVerified, true);
+    assert.equal(mock.localStore.lastManualAcceptance.manualMutationVerified, true);
     assert.equal(mock.localStore.lastManualAcceptance.accountId, '/@example');
+    const status = await send(mock, { type: 'GET_AUTOMATION_STATUS' });
+    assert.equal(status.manualReadVerified, true);
+    assert.equal(status.manualWriteVerified, true);
+    assert.equal(status.acceptanceReady, true);
+  });
+
+  it('rejects incomplete retrieval and failed read-back evidence', async () => {
+    const configured = settings('scheduled');
+    const mock = await setup({ settings: configured, local: {} });
+    const sender = { tab: { url: 'https://www.youtube.com/playlist?list=WL' } };
+    const incomplete = await send(mock, { type: 'RECORD_MANUAL_ACCEPTANCE', playlistId: 'WL', accountId: '/@example', evidenceKind: 'read-noop', moveCount: 0, completenessVerified: false, verifiedRead: true, orderMatched: true, verifiedWrite: false }, sender);
+    const unreadBack = await send(mock, { type: 'RECORD_MANUAL_ACCEPTANCE', playlistId: 'WL', accountId: '/@example', evidenceKind: 'write', moveCount: 1, completenessVerified: true, verifiedRead: true, orderMatched: false, verifiedWrite: true, readbackVerified: false }, sender);
+    assert.equal(incomplete.success, false);
+    assert.equal(unreadBack.success, false);
+    assert.equal(mock.localStore.lastManualAcceptance, undefined);
   });
 
   it('requires fresh manual acceptance after safety settings change', async () => {
     const configured = settings('scheduled');
     const evidence = { manualReorderVerified: true, playlistId: 'WL', accountId: '/@example', fingerprint: 'old-config', moveCount: 1 };
-    const mock = await setup({ settings: configured, local: { lastManualAcceptance: evidence } });
+    const mock = await setup({ settings: configured, local: {
+      automationEnabled: true,
+      automationAuthorization: { manualMutationVerified: true, manualReorderVerified: true, playlistId: 'WL', accountId: '/@example', fingerprint: 'old-config' },
+      lastManualAcceptance: evidence,
+    } });
     const response = await send(mock, { type: 'ENABLE_UNATTENDED_SORTING', confirmed: true });
     assert.equal(response.success, false);
     assert.match(response.error, /manual Watch Later reorder/i);
-    assert.equal(mock.localStore.automationEnabled, undefined);
+    assert.equal(mock.localStore.automationEnabled, true);
+    const status = await send(mock, { type: 'GET_AUTOMATION_STATUS' });
+    assert.equal(status.manualReadVerified, false);
+    assert.equal(status.manualWriteVerified, false);
+    assert.equal(status.authorized, false);
+    assert.equal(status.enabled, false);
   });
 });

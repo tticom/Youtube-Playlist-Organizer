@@ -374,7 +374,7 @@ const WLPanel = {
       catch (err) { console.warn('WLPanel: could not update the retained backup status', err); }
     }
     if (runId !== this._runId) return null;
-    return { result, viewSort, previous };
+    return { result, viewSort, previous, completenessVerified: true };
   },
 
   /**
@@ -398,8 +398,11 @@ const WLPanel = {
    * is long enough for the user to click into a video and navigate away, and
    * without this the timer would reload the page they just opened.
    */
-  _announceAndReload(runId, waitedMs) {
-    WLModal.showBusy(`Sort complete in ${(waitedMs / 1000).toFixed(1)}s. Refreshing...`, { cancellable: false });
+  _announceAndReload(runId, waitedMs, { unchanged = false } = {}) {
+    const message = unchanged
+      ? 'Playlist already matches this sort. Complete read verified; no playlist mutation was made. A successful live reorder is still required to enable unattended writes.'
+      : `Sort complete in ${(waitedMs / 1000).toFixed(1)}s. Refreshing...`;
+    WLModal.showBusy(message, { cancellable: false });
     setTimeout(() => { if (runId === this._runId) location.reload(); }, 1200);
   },
 
@@ -418,22 +421,24 @@ const WLPanel = {
 
     const written = await this._writeOrder(runId, playlistId, orderedSetVideoIds);
     if (!written) return;
-    const { result, viewSort, previous } = written;
+    const { result, viewSort, previous, completenessVerified } = written;
 
     if (!result.applied) {
       await this._writeNotApplied(runId, viewSort);
       return;
     }
 
-    if (result.moveCount > 0) {
-      const accountId = playlistAccountIdentity();
-      if (accountId) await chrome.runtime.sendMessage({
-        type: 'RECORD_MANUAL_ACCEPTANCE', playlistId, accountId,
-        moveCount: result.moveCount,
-        completenessVerified: this.currentReadDiagnostics?.completenessVerified === true,
-        readbackVerified: result.applied === true,
-      }).catch(err => { console.warn('WLPanel: could not record manual acceptance evidence', err); return null; });
-    }
+    const noOpVerified = result.unchanged === true && previous.length === orderedSetVideoIds.length && previous.every((id, index) => id === orderedSetVideoIds[index]);
+    const writeVerified = !noOpVerified && Number(result.moveCount) > 0;
+    const accountId = playlistAccountIdentity();
+    if (accountId && completenessVerified && (noOpVerified || writeVerified)) await chrome.runtime.sendMessage({
+      type: 'RECORD_MANUAL_ACCEPTANCE', playlistId, accountId,
+      evidenceKind: noOpVerified ? 'read-noop' : 'write',
+      moveCount: Number(result.moveCount) || 0,
+      completenessVerified, verifiedRead: true, orderMatched: true,
+      verifiedWrite: writeVerified,
+      readbackVerified: writeVerified && result.applied === true,
+    }).catch(err => { console.warn('WLPanel: could not record manual validation evidence', err); return null; });
 
     // Persist BEFORE the reload — the reload is what makes headings necessary,
     // and it destroys any in-memory state that isn't written first.
@@ -473,7 +478,7 @@ const WLPanel = {
     // "Sort complete" and reload the page the user already left.
     if (runId !== this._runId) return;
 
-    this._announceAndReload(runId, result.waitedMs);
+    this._announceAndReload(runId, result.waitedMs, { unchanged: noOpVerified });
   },
 
   /**
@@ -788,14 +793,17 @@ async function runUnattendedContent(message) {
 
   let snapshot;
   try { snapshot = await WLPlaylist.readSnapshot('WL'); }
-  catch (error) { return { success: false, requiresAttention: /count|complete|duplicate|entry|continuation|page limit/i.test(error.message), accountId, error: error.message }; }
+  catch (error) {
+    const requiresAttention = /count|complete|duplicate|entry|continuation|page limit/i.test(error.message);
+    return { success: false, requiresAttention, retrySafe: !requiresAttention, accountId, error: error.message };
+  }
   const diagnostics = snapshot.diagnostics || {};
   if (!snapshot.videos.length) return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: snapshot.complete === true, error: snapshot.complete ? 'The validated playlist was empty; refusing unattended sorting.' : (snapshot.reason || 'Playlist completeness could not be verified; refusing to write.') };
 
   try {
     await WLEnrich.enrich(snapshot.videos);
     const analysis = await chrome.runtime.sendMessage({ type: 'ANALYZE', videos: snapshot.videos, playlistId: 'WL', manualPreview: false });
-    if (!analysis?.success) return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: analysis?.error || 'Classification failed.' };
+    if (!analysis?.success) return { success: false, retrySafe: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: analysis?.error || 'Classification failed.' };
     if (!snapshot.complete) return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: false, classifiedCount: analysis.classifiedCount || 0, error: snapshot.reason || 'Playlist completeness could not be verified; classification was saved but no write was attempted.', preview: analysis.sortOrder.map(video => ({ title: video.title, subject: video.cluster || video.category || '' })) };
     const target = analysis.sortOrder.map(video => video.setVideoId);
     const original = snapshot.videos.map(video => video.setVideoId);
@@ -809,7 +817,7 @@ async function runUnattendedContent(message) {
 
     if (!message.expectedAccountId || playlistAccountIdentity() !== message.expectedAccountId) return { success: false, requiresAttention: true, accountId: playlistAccountIdentity(), pageCount: diagnostics.pageCount, completenessVerified: true, error: 'The YouTube account changed before the reorder. No write was sent.' };
     const viewSort = await WLViewSort.ensureManual();
-    if (viewSort !== 'manual') return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: 'Could not confirm YouTube Manual playlist view; no reorder was sent.' };
+    if (viewSort !== 'manual') return { success: false, retrySafe: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: 'Could not confirm YouTube Manual playlist view; no reorder was sent.' };
     const immediate = await WLPlaylist.readSnapshot('WL');
     const immediateOrder = immediate.videos.map(video => video.setVideoId);
     if (!immediate.complete || immediateOrder.join(',') !== original.join(',')) return { success: false, requiresAttention: true, accountId, pageCount: immediate.diagnostics?.pageCount || diagnostics.pageCount, completenessVerified: immediate.complete, error: immediate.reason || 'Watch Later changed since inspection; no reorder was sent.' };
@@ -827,7 +835,8 @@ async function runUnattendedContent(message) {
       const write = await WLPlaylist.applyOrder('WL', target, { complete: true, originalOrder: original });
       if (!write.applied) {
         await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'not-applied' });
-        return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: write.error || 'YouTube did not verify the reordered playlist.' };
+        const retrySafe = write.retrySafe === true && write.originalOrderUnchanged === true && write.completenessVerified === true;
+        return { success: false, retrySafe, requiresAttention: !retrySafe, applied: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: write.error || 'YouTube did not verify the reordered playlist.' };
       }
       await WLStorage.setUndo({ playlistId: 'WL', previous: original, current: target, status: 'verified' });
       return { success: true, applied: true, alreadyOrdered: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, classifiedCount: analysis.classifiedCount || 0, moveCount: write.moveCount || 0 };
@@ -836,7 +845,7 @@ async function runUnattendedContent(message) {
       return { success: false, requiresAttention: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: `Reorder result is uncertain; inspect Watch Later and the saved recovery backup. ${error.message}` };
     }
   } catch (error) {
-    return { success: false, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: error.message };
+    return { success: false, retrySafe: true, accountId, pageCount: diagnostics.pageCount, completenessVerified: true, error: error.message };
   }
 }
 

@@ -314,7 +314,7 @@ describe('WLPlaylist.applyOrder', () => {
     assert.equal(result.applied, true);
   });
 
-  it('reports applied:false when the order never converges', async () => {
+  it('reports applied:false as retry-safe only while complete read-back still matches the original order', async () => {
     const { playlist } = withCalls((endpoint) =>
       endpoint === 'browse/edit_playlist'
         ? { status: 'STATUS_SUCCEEDED' }
@@ -327,6 +327,10 @@ describe('WLPlaylist.applyOrder', () => {
     );
     const result = await playlist.applyOrder('PLx', ['B', 'A'], { timeoutMs: 50, intervalMs: 10, complete: true, originalOrder: ['A', 'B'] });
     assert.equal(result.applied, false);
+    assert.equal(result.retrySafe, true);
+    assert.equal(result.originalOrderUnchanged, true);
+    assert.equal(result.completenessVerified, true);
+    assert.match(result.error, /still matches its original order/i);
   });
 
   it('retries on stale reads until the order converges', async () => {

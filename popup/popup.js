@@ -312,12 +312,14 @@ async function refreshAutomationStatus() {
     `Unattended sorting: ${status.enabled ? 'enabled' : status.paused ? 'paused' : 'disabled'}`,
     `Mode: ${status.mode}${status.mode === 'scheduled' ? ` · every ${status.scheduleMinutes} minutes` : ''}`,
     `Authorized account: ${status.authorized ? status.authorization.accountId : 'none / needs reauthorization'}`,
+    `Manual read validation: ${status.manualReadVerified ? 'verified complete read and matching order' : 'not verified for current account and settings'}`,
+    `Live mutation evidence: ${status.manualWriteVerified ? 'verified write and read-back' : 'not verified; a no-op read does not test YouTube writes'}`,
     `Last attempt: ${status.lastAttemptedRun ? new Date(status.lastAttemptedRun).toLocaleString() : 'never'}`,
     `Last success: ${status.lastSuccessfulRun ? new Date(status.lastSuccessfulRun).toLocaleString() : 'never'}`,
     status.mode === 'scheduled' ? `Next scheduled run: ${status.nextScheduledRun ? new Date(status.nextScheduledRun).toLocaleString() : 'not scheduled'}` : '',
     last ? `Last result: ${last.status}; classified ${last.classifiedCount || 0}; reordered ${last.reorderedCount || 0}; already ordered ${last.alreadyOrdered ? 'yes' : 'no'}` : '',
     status.pauseReason ? `Attention: ${status.pauseReason}` : '',
-    status.enabled ? '' : status.mode === 'manual' && status.authorized ? 'Manual mode does not run unattended. Choose an unattended mode to resume the saved consent.' : status.authorized ? 'Authorization is saved; enable or resume to run.' : 'A verified manual reorder and explicit unattended consent are required to enable writes.',
+    status.enabled ? '' : status.mode === 'manual' && status.authorized ? 'Manual mode does not run unattended. Choose an unattended mode to resume the saved consent.' : status.authorized ? 'Authorization is saved; enable or resume to run.' : status.manualReadVerified ? 'Your read validation succeeded without a write. To enable unattended writes, perform and verify one explicitly authorised live reorder, then confirm unattended consent.' : 'A complete manual validation and a separately verified live reorder are required before explicit unattended consent can enable writes.',
   ].filter(Boolean).join('\n');
   $('#automation-enable').disabled = status.enabled || !status.acceptanceReady || status.mode === 'manual';
   $('#automation-pause').disabled = !status.enabled;

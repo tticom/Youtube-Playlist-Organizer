@@ -233,6 +233,6 @@ const WLPlaylist = {
       }
       if (attempt + 1 < Math.min(3, maxAttempts)) await new Promise(resolve => setTimeout(resolve, intervalMs * (2 ** attempt)));
     }
-    return { applied: false, moveCount: actions.length, waitedMs: Date.now() - started, error: 'YouTube did not confirm the new order. The playlist still matches its original order; no further write was attempted.' };
+    return { applied: false, moveCount: actions.length, waitedMs: Date.now() - started, retrySafe: true, originalOrderUnchanged: true, completenessVerified: true, error: 'YouTube did not confirm the new order. The playlist still matches its original order; no further write was attempted.' };
   },
 };

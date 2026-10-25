@@ -278,6 +278,46 @@ describe('background unattended content handler', () => {
     assert.deepEqual(events, ['backup:pending', 'write', 'backup:verified']);
     assert.deepEqual(backups[0].previous, ['A', 'B']);
   });
+
+  it('returns an applyOrder retry exhaustion as an unsuccessful but safe-to-retry run', async () => {
+    const a = { id: 'a', setVideoId: 'A', title: 'A', unavailable: false };
+    const b = { id: 'b', setVideoId: 'B', title: 'B', unavailable: false };
+    const videos = [a, b]; const backups = [];
+    const loc = { href: 'https://www.youtube.com/playlist?list=WL#wl-organizer-automation', pathname: '/playlist', search: '?list=WL', hash: '#wl-organizer-automation' };
+    const { runtimeMessages } = loadPanelWithStubs({
+      sendMessage: async message => message.type === 'ANALYZE' ? { success: true, sortOrder: [b, a], classifiedCount: 1 } : { success: true, enabled: true, authorized: true, accountId: '/@example', mode: 'scheduled' },
+      enrich: async () => {}, videos, location: loc, document: accountDocument(),
+      readSnapshot: async () => ({ videos, complete: true, diagnostics: { pageCount: 1 } }),
+      ensureManual: async () => 'manual',
+      setUndo: async value => { backups.push(value); },
+      applyOrder: async () => ({ applied: false, retrySafe: true, originalOrderUnchanged: true, completenessVerified: true, moveCount: 1, error: 'YouTube did not confirm the new order. The playlist still matches its original order; no further write was attempted.' }),
+    });
+    const result = await invoke(runtimeMessages.listener, { type: 'RUN_UNATTENDED_AUTOMATION', apply: true, expectedAccountId: '/@example' });
+    assert.equal(result.success, false);
+    assert.equal(result.retrySafe, true);
+    assert.equal(result.requiresAttention, false);
+    assert.equal(result.applied, false);
+    assert.deepEqual(backups.map(item => item.status), ['pending', 'not-applied']);
+  });
+
+  it('marks an uncertain or partially changed applyOrder exception as attention-required', async () => {
+    const a = { id: 'a', setVideoId: 'A', title: 'A', unavailable: false };
+    const b = { id: 'b', setVideoId: 'B', title: 'B', unavailable: false };
+    const videos = [a, b]; const backups = [];
+    const loc = { href: 'https://www.youtube.com/playlist?list=WL#wl-organizer-automation', pathname: '/playlist', search: '?list=WL', hash: '#wl-organizer-automation' };
+    const { runtimeMessages } = loadPanelWithStubs({
+      sendMessage: async message => message.type === 'ANALYZE' ? { success: true, sortOrder: [b, a], classifiedCount: 1 } : { success: true, enabled: true, authorized: true, accountId: '/@example', mode: 'scheduled' },
+      enrich: async () => {}, videos, location: loc, document: accountDocument(),
+      readSnapshot: async () => ({ videos, complete: true, diagnostics: { pageCount: 1 } }),
+      ensureManual: async () => 'manual', setUndo: async value => { backups.push(value); },
+      applyOrder: async () => { throw new Error('Playlist changed during reorder; partial state is possible.'); },
+    });
+    const result = await invoke(runtimeMessages.listener, { type: 'RUN_UNATTENDED_AUTOMATION', apply: true, expectedAccountId: '/@example' });
+    assert.equal(result.success, false);
+    assert.equal(result.retrySafe, undefined);
+    assert.equal(result.requiresAttention, true);
+    assert.deepEqual(backups.map(item => item.status), ['pending', 'uncertain']);
+  });
 });
 
 describe('RESORT is AI-only', () => {
@@ -463,6 +503,45 @@ describe('applySort — post-sort reload', () => {
     await WLPanel.applySort();
     assert.equal(reloaded, false, 'a thrown apply error must leave the error on screen');
     assert.deepEqual(modalCalls.showError, ['network blew up']);
+  });
+
+  it('records a complete verified no-op read without claiming a mutation', async () => {
+    const video = { id: 'a', setVideoId: 'A' };
+    const sent = [];
+    const document = { ...documentStub, querySelector: () => ({ getAttribute: () => '/@example' }) };
+    const { WLPanel, modalCalls } = loadPanelWithStubs({
+      sendMessage: async message => { sent.push(message); return { success: true }; },
+      readSnapshot: async () => ({ videos: [video], complete: true }),
+      applyOrder: async () => ({ applied: true, unchanged: true, moveCount: 0, waitedMs: 0 }),
+      reload: () => {}, runTimers: true, sortOrder: [video], playlistId: 'WL', document,
+    });
+    await WLPanel.applySort();
+    const record = sent.find(message => message.type === 'RECORD_MANUAL_ACCEPTANCE');
+    assert.deepEqual({
+      evidenceKind: record.evidenceKind, moveCount: record.moveCount, completenessVerified: record.completenessVerified,
+      verifiedRead: record.verifiedRead, orderMatched: record.orderMatched, verifiedWrite: record.verifiedWrite,
+      readbackVerified: record.readbackVerified,
+    }, { evidenceKind: 'read-noop', moveCount: 0, completenessVerified: true, verifiedRead: true, orderMatched: true, verifiedWrite: false, readbackVerified: false });
+    assert.ok(modalCalls.showBusy.some(text => /already matches.*no playlist mutation.*still required/i.test(text)));
+  });
+
+  it('records write evidence only after a persisted manual mutation is verified', async () => {
+    const source = [{ id: 'a', setVideoId: 'A' }, { id: 'b', setVideoId: 'B' }];
+    const sent = [];
+    const document = { ...documentStub, querySelector: () => ({ getAttribute: () => '/@example' }) };
+    const { WLPanel } = loadPanelWithStubs({
+      sendMessage: async message => { sent.push(message); return { success: true }; },
+      readSnapshot: async () => ({ videos: source, complete: true }),
+      applyOrder: async () => ({ applied: true, moveCount: 1, waitedMs: 10 }),
+      reload: () => {}, runTimers: true, sortOrder: [source[1], source[0]], playlistId: 'WL', document,
+    });
+    await WLPanel.applySort();
+    const record = sent.find(message => message.type === 'RECORD_MANUAL_ACCEPTANCE');
+    assert.equal(record.evidenceKind, 'write');
+    assert.equal(record.verifiedRead, true);
+    assert.equal(record.verifiedWrite, true);
+    assert.equal(record.readbackVerified, true);
+    assert.equal(record.moveCount, 1);
   });
 
   it('a superseded apply does not reload and does not announce success', async () => {

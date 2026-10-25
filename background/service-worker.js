@@ -14,13 +14,16 @@ async function getAutomationStatus() {
   const local = await chrome.storage.local.get(['automationEnabled', 'automationPaused', 'automationState', 'automationAuthorization', 'automationHistory', 'automationLock', 'learningState', 'lastManualAcceptance']);
   const fingerprint = automationFingerprint(settings, createLearningState(local.learningState));
   const authorization = local.automationAuthorization;
-  const authorized = Boolean(authorization?.manualReorderVerified && authorization?.playlistId === 'WL' && authorization?.accountId && authorization?.fingerprint === fingerprint);
+  const authorized = Boolean((authorization?.manualMutationVerified || authorization?.manualReorderVerified) && authorization?.playlistId === 'WL' && authorization?.accountId && authorization?.fingerprint === fingerprint);
   const acceptance = local.lastManualAcceptance;
-  const acceptanceReady = Boolean(acceptance?.manualReorderVerified && acceptance?.playlistId === 'WL' && acceptance?.accountId && acceptance?.fingerprint === fingerprint && acceptance?.moveCount > 0);
+  const matchingAcceptance = Boolean(acceptance?.playlistId === 'WL' && acceptance?.accountId && acceptance?.fingerprint === fingerprint);
+  const manualReadVerified = Boolean(matchingAcceptance && acceptance.manualReadVerified === true && acceptance.completenessVerified === true && acceptance.orderMatched === true);
+  const manualWriteVerified = Boolean(matchingAcceptance && (acceptance.manualMutationVerified === true || (acceptance.manualReorderVerified === true && Number(acceptance.moveCount) > 0)));
+  const acceptanceReady = manualWriteVerified;
   const enabled = local.automationEnabled === true && authorized && local.automationPaused !== true && settings.automation.mode !== 'manual';
   const alarm = chrome.alarms?.get ? await chrome.alarms.get(AUTOMATION_ALARM).catch(() => null) : null;
   return {
-    enabled, authorized, acceptanceReady, mode: settings.automation.mode, scheduleMinutes: settings.automation.scheduleMinutes,
+    enabled, authorized, acceptanceReady, manualReadVerified, manualWriteVerified, mode: settings.automation.mode, scheduleMinutes: settings.automation.scheduleMinutes,
     notifications: settings.automation.notifications, paused: local.automationPaused === true,
     pauseReason: local.automationState?.pauseReason || null,
     lastAttemptedRun: local.automationState?.lastAttemptedRun || null,
@@ -64,16 +67,30 @@ async function saveAutomationStatus(update = {}) {
 
 async function recordManualAcceptance(message, sender) {
   const settings = await loadSettings();
-  const { learningState } = await chrome.storage.local.get('learningState');
+  const { learningState, lastManualAcceptance: previous } = await chrome.storage.local.get(['learningState', 'lastManualAcceptance']);
   const accountId = String(message.accountId || '');
   const moveCount = Number(message.moveCount) || 0;
   let senderPlaylist = null;
   try { const url = new URL(sender?.tab?.url); if (url.origin === 'https://www.youtube.com' && url.pathname === '/playlist') senderPlaylist = url.searchParams.get('list'); } catch {}
-  if (senderPlaylist !== 'WL') return { success: false, error: 'Manual acceptance evidence must come from the Watch Later tab.' };
-  if (message.playlistId !== 'WL' || !accountId || message.completenessVerified !== true || message.readbackVerified !== true || moveCount < 1) {
-    return { success: false, error: 'A verified Watch Later reorder with at least one applied move is required before unattended sorting can be enabled.' };
+  const fingerprint = automationFingerprint(settings, createLearningState(learningState));
+  const kind = message.evidenceKind;
+  const commonReadProof = message.playlistId === 'WL' && Boolean(accountId) && message.completenessVerified === true && message.verifiedRead === true && message.orderMatched === true;
+  const validNoop = kind === 'read-noop' && moveCount === 0 && message.verifiedWrite === false;
+  const validWrite = kind === 'write' && moveCount > 0 && message.verifiedWrite === true && message.readbackVerified === true;
+  if (senderPlaylist !== 'WL') return { success: false, error: 'Manual validation evidence must come from the Watch Later tab.' };
+  if (!commonReadProof || (!validNoop && !validWrite)) {
+    return { success: false, error: 'Manual validation requires a complete verified Watch Later read whose order matched the requested sort. Unattended writes additionally require a separately verified live mutation and read-back.' };
   }
-  const acceptance = { playlistId: 'WL', accountId, moveCount, fingerprint: automationFingerprint(settings, createLearningState(learningState)), verifiedAt: Date.now(), manualReorderVerified: true };
+  const previousMatches = previous?.playlistId === 'WL' && previous?.accountId === accountId && previous?.fingerprint === fingerprint;
+  const manualMutationVerified = validWrite || Boolean(previousMatches && (previous.manualMutationVerified === true || (previous.manualReorderVerified === true && Number(previous.moveCount) > 0)));
+  const acceptance = {
+    playlistId: 'WL', accountId, fingerprint, moveCount,
+    evidenceKind: kind, manualReadVerified: true, completenessVerified: true, orderMatched: true, readVerifiedAt: Date.now(),
+    manualMutationVerified,
+    manualReorderVerified: manualMutationVerified,
+    ...(validWrite ? { readbackVerified: true, writeVerifiedAt: Date.now() } : previousMatches && manualMutationVerified ? { readbackVerified: previous.readbackVerified === true, writeVerifiedAt: previous.writeVerifiedAt } : {}),
+    verifiedAt: Date.now(),
+  };
   await chrome.storage.local.set({ lastManualAcceptance: acceptance });
   return { success: true, acceptance };
 }
@@ -84,7 +101,7 @@ async function enableUnattendedSorting({ confirmed = false } = {}) {
   const acceptance = status.lastManualAcceptance;
   if (status.settings.automation.mode === 'manual') return { success: false, error: 'Choose Automatic on opening Watch Later or Scheduled unattended before enabling unattended sorting.' };
   const fingerprint = automationFingerprint(status.settings, (await chrome.storage.local.get('learningState')).learningState || {});
-  if (!acceptance?.manualReorderVerified || acceptance.playlistId !== 'WL' || !acceptance.accountId || acceptance.fingerprint !== fingerprint) {
+  if (!(acceptance?.manualMutationVerified === true || (acceptance?.manualReorderVerified === true && Number(acceptance.moveCount) > 0)) || acceptance.playlistId !== 'WL' || !acceptance.accountId || acceptance.fingerprint !== fingerprint) {
     return { success: false, error: 'Complete and verify a manual Watch Later reorder using the current saved settings before enabling unattended sorting.' };
   }
   await chrome.storage.local.set({ automationEnabled: true, automationPaused: false, automationAuthorization: { ...acceptance, consentedAt: Date.now() } });
@@ -176,9 +193,14 @@ async function runAutomationExclusive(trigger) {
     const message = { type: 'RUN_UNATTENDED_AUTOMATION', runId, apply: !previewOnly, expectedAccountId: status.authorization?.accountId || null };
     try { result = await chrome.tabs.sendMessage(tabId, message); }
     catch (error) { throw Object.assign(new Error(`Automation result is ambiguous after dispatch: ${error.message}`), { requiresAttention: true }); }
-    if (!result?.success) throw Object.assign(new Error(result?.error || 'Content script returned no result.'), { automationResult: result });
+    if (!result?.success) throw Object.assign(new Error(result?.error || 'Content script returned no result.'), { automationResult: result, requiresAttention: result?.requiresAttention === true || result?.retrySafe !== true });
     if (result.requiresAttention) throw Object.assign(new Error(result.error || 'Playlist integrity needs attention.'), { requiresAttention: true, automationResult: result });
     if (result.accountId && status.authorization?.accountId && result.accountId !== status.authorization.accountId) throw Object.assign(new Error('The active YouTube account differs from the account authorized for unattended sorting.'), { requiresAttention: true });
+
+    const validPreview = result.previewOnly === true && result.completenessVerified === true && result.applied !== true;
+    const validNoop = result.alreadyOrdered === true && result.completenessVerified === true && Number(result.moveCount || 0) === 0 && result.applied !== true;
+    const validWrite = result.applied === true && result.alreadyOrdered !== true && result.previewOnly !== true && result.completenessVerified === true && Number(result.moveCount || 0) > 0;
+    if (!validPreview && !validNoop && !validWrite) throw Object.assign(new Error('Content script returned success without a complete, verified preview, no-op, or persisted write result.'), { requiresAttention: true, automationResult: { ...result, requiresAttention: true } });
 
     const summary = { id: runId, attemptedAt: now, status: result.applied ? 'success' : result.previewOnly ? 'preview' : result.alreadyOrdered ? 'success' : 'failed', classifiedCount: result.classifiedCount, reorderedCount: result.moveCount, alreadyOrdered: result.alreadyOrdered, pageCount: result.pageCount, completenessVerified: result.completenessVerified, error: result.error };
     const history = appendRunHistory(automationHistory, summary);
